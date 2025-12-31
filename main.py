@@ -1,4 +1,5 @@
 # backend/main.py
+import webbrowser
 import os
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -513,3 +514,4 @@ async def root():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
