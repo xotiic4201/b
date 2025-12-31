@@ -33,13 +33,12 @@ app.add_middleware(
 )
 
 # ========== ENVIRONMENT VARIABLES ==========
-# THESE GO IN RENDER.COM ENVIRONMENT VARIABLES
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", secrets.token_urlsafe(32))
 ADMIN_INITIAL_PASSWORD = os.getenv("ADMIN_INITIAL_PASSWORD", "40671Mps19*")
 
-# Initialize Supabase
+# Initialize Supabase AFTER loading env vars
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Security
@@ -514,4 +513,5 @@ async def root():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
