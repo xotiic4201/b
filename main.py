@@ -27,7 +27,7 @@ app = FastAPI(
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (adjust for production)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -131,6 +131,7 @@ async def startup_event():
     try:
         if not SUPABASE_URL or not SUPABASE_KEY:
             print("⚠️  Supabase credentials not set")
+            print("💡 Please set SUPABASE_URL and SUPABASE_KEY environment variables")
             return
         
         print(f"🔗 Initializing Supabase connection...")
@@ -139,7 +140,7 @@ async def startup_event():
         # Test connection
         try:
             response = supabase_client.table("users").select("count", count="exact").limit(1).execute()
-            print(f"✅ Database connected: {len(response.data)} users found")
+            print(f"✅ Database connected")
             
             # Check if admin user exists, create if not
             admin_email = "admin@system.io"
@@ -158,7 +159,7 @@ async def startup_event():
             
         except Exception as e:
             print(f"❌ Database test failed: {str(e)}")
-            print("💡 Make sure you've created the tables in Supabase")
+            print("💡 Please create the tables in Supabase using the SQL schema provided")
             return
         
         supabase = supabase_client
