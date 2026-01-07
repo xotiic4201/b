@@ -122,22 +122,36 @@ def get_db_connection():
     
     if db_conn is None or db_conn.closed:
         try:
-            # Try DATABASE_URL first, then SUPABASE_URL
-            db_url = DATABASE_URL or SUPABASE_URL
+            # Get connection string from environment
+            db_url = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
             
             if not db_url:
                 print("⚠️ No database URL provided")
                 return None
             
+            # Debug: Print the URL (remove this in production)
+            print(f"🔧 Database URL: {db_url[:50]}...")
+            
             # Ensure proper connection string format
-            if db_url.startswith("postgresql://"):
-                db_url = db_url.replace("postgresql://", "postgres://")
+            # Supabase typically uses: postgresql://postgres:[YOUR-PASSWORD]@[YOUR-HOST]:5432/postgres
+            if not db_url.startswith("postgresql://") and not db_url.startswith("postgres://"):
+                print(f"❌ Invalid database URL format. Must start with 'postgresql://' or 'postgres://'")
+                return None
             
-            db_conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor)
-            print(f"✅ Database connected")
+            # Connect to database
+            db_conn = psycopg2.connect(
+                db_url,
+                cursor_factory=RealDictCursor,
+                connect_timeout=10  # 10 second timeout
+            )
+            print(f"✅ Database connected successfully")
+            return db_conn
             
+        except psycopg2.OperationalError as e:
+            print(f"❌ Database connection failed: {e}")
+            return None
         except Exception as e:
-            print(f"❌ Database connection error: {e}")
+            print(f"❌ Unexpected database error: {e}")
             return None
     
     return db_conn
@@ -1274,5 +1288,6 @@ async def startup_event():
     print(f"   • Admin: ws://localhost:{PORT}/ws/admin")
     print(f"   • Client: ws://localhost:{PORT}/ws/client/{{client_id}}")
     print(f"📚 Documentation: http://localhost:{PORT}/docs")
+
 
 
