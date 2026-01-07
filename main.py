@@ -15,7 +15,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # Load environment variables
-load_dotenv()
+
 
 # Create FastAPI app
 app = FastAPI(
@@ -1279,3 +1279,4 @@ async def startup_event():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
