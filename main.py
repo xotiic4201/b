@@ -152,20 +152,7 @@ async def startup_event():
             test_response = supabase_client.table("users").select("count", count="exact").limit(1).execute()
             print(f"✅ Database connected successfully")
             
-            # Check if admin user exists, create if not
-            admin_email = "admin@system.io"
-            admin_response = supabase_client.table("users").select("*").eq("email", admin_email).execute()
             
-            if not admin_response.data:
-                hashed_pw = hash_password("password123")
-                supabase_client.table("users").insert({
-                    "email": admin_email,
-                    "password_hash": hashed_pw,
-                    "is_admin": True,
-                    "is_active": True,
-                    "created_at": datetime.utcnow().isoformat()
-                }).execute()
-                print(f"✅ Created admin user: {admin_email} / password123")
             
         except Exception as e:
             print(f"❌ Database test failed: {str(e)}")
@@ -1111,3 +1098,4 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
+
