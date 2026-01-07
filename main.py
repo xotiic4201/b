@@ -15,7 +15,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # Load environment variables
-
+load_dotenv()
 
 # Create FastAPI app
 app = FastAPI(
@@ -1288,6 +1288,7 @@ async def startup_event():
     print(f"   • Admin: ws://localhost:{PORT}/ws/admin")
     print(f"   • Client: ws://localhost:{PORT}/ws/client/{{client_id}}")
     print(f"📚 Documentation: http://localhost:{PORT}/docs")
+
 
 
 
