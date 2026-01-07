@@ -1,15 +1,11 @@
 # backend/main.py
-import webbrowser
 import os
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, Request
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 import uvicorn
-import hashlib
-import base64
-import asyncio
 from datetime import datetime, timedelta
 import secrets
 import json
@@ -36,9 +32,9 @@ app.add_middleware(
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", secrets.token_urlsafe(32))
-ADMIN_INITIAL_PASSWORD = os.getenv("ADMIN_INITIAL_PASSWORD", "")
+ADMIN_INITIAL_PASSWORD = os.getenv("ADMIN_INITIAL_PASSWORD", "password123")
 
-# Initialize Supabase as None - will be set in startup
+# Initialize Supabase
 supabase: Optional[Client] = None
 
 # Security
@@ -60,17 +56,13 @@ class CommandRequest(BaseModel):
     command: str
     parameters: Dict = {}
 
-class TokenData(BaseModel):
-    email: str
-    is_admin: bool
-
 # ========== HELPER FUNCTIONS ==========
 def get_supabase() -> Client:
-    """Get Supabase client, ensuring it's initialized"""
+    """Get Supabase client"""
     if supabase is None:
         raise HTTPException(
             status_code=500,
-            detail="Database not initialized. Please check server logs."
+            detail="Database not initialized"
         )
     return supabase
 
@@ -82,7 +74,10 @@ def hash_password(password: str) -> str:
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify password"""
-    return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())
+    try:
+        return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())
+    except:
+        return False
 
 def create_jwt_token(data: dict, expires_delta: timedelta = None):
     """Create JWT token"""
@@ -127,77 +122,30 @@ async def startup_event():
     try:
         # Validate environment variables
         if not SUPABASE_URL:
-            raise ValueError("SUPABASE_URL must be set in environment variables")
+            print("❌ SUPABASE_URL must be set in environment variables")
+            return
+            
         if not SUPABASE_KEY:
-            raise ValueError("SUPABASE_KEY must be set in environment variables")
+            print("❌ SUPABASE_KEY must be set in environment variables")
+            return
         
-        print(f"Initializing Supabase with URL: {SUPABASE_URL}")
-        print(f"Supabase key present: {'Yes' if SUPABASE_KEY else 'No'}")
-        
-        if not ADMIN_INITIAL_PASSWORD:
-            print("⚠️  WARNING: ADMIN_INITIAL_PASSWORD is not set. Using default.")
-            # You might want to set a default or exit
-            # For security, it's better to exit if not set in production
-            import sys
-            if not os.getenv("RENDER"):
-                print("Exiting: ADMIN_INITIAL_PASSWORD is required")
-                sys.exit(1)
+        print(f"🔗 Initializing Supabase connection...")
         
         # Initialize Supabase client
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✓ Supabase client initialized")
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Test connection
+        # Test connection with a simple query
         try:
-            # Simple test query
-            response = supabase.table("users").select("count", count="exact").limit(1).execute()
-            print("✓ Supabase connection test successful")
+            response = supabase_client.table("users").select("count", count="exact").limit(1).execute()
+            print("✅ Database connection successful")
+            global supabase
+            supabase = supabase_client
         except Exception as e:
-            print(f"✗ Supabase connection failed: {e}")
-            # Re-raise to prevent app from starting with broken DB
-            raise
-        
-        # Create tables if they don't exist
-        # Note: Supabase doesn't have exec_sql RPC by default
-        # We'll try to create tables with individual queries
-        print("Checking/creating database tables...")
-        
-        # Check if tables exist by trying to query them
-        tables_to_check = ["users", "clients", "commands", "logs", "screenshots"]
-        for table in tables_to_check:
-            try:
-                supabase.table(table).select("id").limit(1).execute()
-                print(f"✓ Table '{table}' exists")
-            except Exception as e:
-                print(f"✗ Table '{table}' doesn't exist or error: {e}")
-                # In production, you should create tables via Supabase SQL editor
-                # or use migrations
-        
-        # Check if admin user exists
-        admin_email = "admin@cyber.io"
-        try:
-            response = supabase.table("users").select("*").eq("email", admin_email).execute()
-            
-            if not response.data:
-                # Create admin user with hashed password
-                hashed_password = hash_password(ADMIN_INITIAL_PASSWORD)
-                supabase.table("users").insert({
-                    "email": admin_email,
-                    "password_hash": hashed_password,
-                    "is_admin": True
-                }).execute()
-                print("✓ Admin user created")
-            else:
-                print("✓ Admin user already exists")
-        except Exception as e:
-            print(f"⚠️  Admin user setup error (table might not exist): {e}")
-            
-        print("✓ Database initialization complete")
+            print(f"❌ Database connection failed: {str(e)}")
+            print("⚠️  Make sure you've created the tables using the SQL provided")
             
     except Exception as e:
-        print(f"❌ Database initialization error: {e}")
-        # Don't raise here if you want the app to start anyway
-        # But log it clearly
+        print(f"❌ Startup error: {str(e)}")
         import traceback
         traceback.print_exc()
 
@@ -206,55 +154,77 @@ async def startup_event():
 async def login(data: LoginRequest):
     """Login endpoint"""
     try:
-        db = get_supabase()
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Database not initialized")
         
-        # Check if user exists in database
-        response = db.table("users").select("*").eq("email", data.email).execute()
+        # Check if user exists
+        response = supabase.table("users") \
+            .select("*") \
+            .eq("email", data.email) \
+            .execute()
         
         if not response.data:
             raise HTTPException(status_code=401, detail="Invalid credentials")
         
         user = response.data[0]
         
-        # Verify password (hashed in database)
+        # Verify password
         if not verify_password(data.password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid credentials")
         
+        # Check if user is active
+        if not user.get("is_active", True):
+            raise HTTPException(status_code=401, detail="Account disabled")
+        
         # Create JWT token
         token_data = {
+            "sub": user["email"],
             "email": user["email"],
-            "is_admin": user["is_admin"],
-            "sub": user["email"]
+            "is_admin": user.get("is_admin", False),
+            "user_id": str(user["id"])
         }
         access_token = create_jwt_token(token_data)
+        
+        # Update last login
+        try:
+            supabase.table("users") \
+                .update({"last_login": datetime.utcnow().isoformat()}) \
+                .eq("id", user["id"]) \
+                .execute()
+        except:
+            pass  # Optional update
         
         return {
             "success": True,
             "token": access_token,
             "user": {
                 "email": user["email"],
-                "is_admin": user["is_admin"]
+                "is_admin": user.get("is_admin", False)
             }
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Login error: {e}")
+        print(f"Login error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/register-client")
 async def register_client(data: ClientRegister, request: Request):
     """Register a new client"""
     try:
-        db = get_supabase()
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Database not initialized")
         
         # Get client IP from request
         if not data.ip_address:
-            data.ip_address = request.client.host
+            data.ip_address = request.client.host if request.client else "127.0.0.1"
         
         # Check if client exists
-        response = db.table("clients").select("*").eq("client_id", data.client_id).execute()
+        response = supabase.table("clients") \
+            .select("*") \
+            .eq("client_id", data.client_id) \
+            .execute()
         
         client_data = {
             "client_id": data.client_id,
@@ -267,91 +237,103 @@ async def register_client(data: ClientRegister, request: Request):
         
         if response.data:
             # Update existing client
-            db.table("clients").update(client_data).eq("client_id", data.client_id).execute()
+            supabase.table("clients") \
+                .update(client_data) \
+                .eq("client_id", data.client_id) \
+                .execute()
+            client_id = response.data[0]["id"]
         else:
             # Create new client
-            db.table("clients").insert(client_data).execute()
+            insert_response = supabase.table("clients") \
+                .insert(client_data) \
+                .execute()
+            client_id = insert_response.data[0]["id"]
         
         # Add log entry
         try:
-            client_res = db.table("clients").select("id").eq("client_id", data.client_id).execute()
-            if client_res.data:
-                db.table("logs").insert({
-                    "client_id": client_res.data[0]["id"],
-                    "log_type": "info",
-                    "message": f"Client registered: {data.name}"
-                }).execute()
-        except:
-            pass  # Logs table might not exist yet
+            supabase.table("logs").insert({
+                "client_id": client_id,
+                "log_type": "info",
+                "message": f"Client registered: {data.name}"
+            }).execute()
+        except Exception as e:
+            print(f"Log insertion error: {str(e)}")
         
         return {"success": True, "message": "Client registered"}
         
     except Exception as e:
-        print(f"Client registration error: {e}")
+        print(f"Client registration error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/clients")
 async def get_clients(_: dict = Depends(authenticate_user)):
     """Get all clients"""
     try:
-        db = get_supabase()
-        response = db.table("clients").select("*").order("last_seen", desc=True).execute()
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Database not initialized")
+        
+        response = supabase.table("clients") \
+            .select("*") \
+            .order("last_seen", desc=True) \
+            .execute()
+        
         return {"success": True, "clients": response.data}
     except Exception as e:
+        print(f"Get clients error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/commands")
-async def get_commands(
-    _: dict = Depends(authenticate_user),
-    limit: int = 50
-):
+async def get_commands(_: dict = Depends(authenticate_user), limit: int = 50):
     """Get recent commands"""
     try:
-        db = get_supabase()
-        response = db.table("commands")\
-            .select("*, clients(client_id, name)")\
-            .order("created_at", desc=True)\
-            .limit(limit)\
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Database not initialized")
+        
+        response = supabase.table("commands") \
+            .select("*, clients(client_id, name)") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
             .execute()
+        
         return {"success": True, "commands": response.data}
     except Exception as e:
+        print(f"Get commands error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/screenshots")
-async def get_screenshots(
-    _: dict = Depends(authenticate_user),
-    limit: int = 10
-):
+async def get_screenshots(_: dict = Depends(authenticate_user), limit: int = 10):
     """Get recent screenshots"""
     try:
-        db = get_supabase()
-        response = db.table("screenshots")\
-            .select("*, clients(client_id, name)")\
-            .order("created_at", desc=True)\
-            .limit(limit)\
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Database not initialized")
+        
+        response = supabase.table("screenshots") \
+            .select("*, clients(client_id, name)") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
             .execute()
+        
         return {"success": True, "screenshots": response.data}
     except Exception as e:
+        print(f"Get screenshots error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/logs")
-async def get_logs(
-    _: dict = Depends(authenticate_user),
-    client_id: Optional[str] = None,
-    limit: int = 100
-):
+async def get_logs(_: dict = Depends(authenticate_user), client_id: Optional[str] = None, limit: int = 100):
     """Get system logs"""
     try:
-        db = get_supabase()
-        query = db.table("logs")\
-            .select("*, clients(client_id, name)")\
-            .order("created_at", desc=True)\
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Database not initialized")
+        
+        query = supabase.table("logs") \
+            .select("*, clients(client_id, name)") \
+            .order("created_at", desc=True) \
             .limit(limit)
         
         if client_id:
-            client_res = db.table("clients")\
-                .select("id")\
-                .eq("client_id", client_id)\
+            client_res = supabase.table("clients") \
+                .select("id") \
+                .eq("client_id", client_id) \
                 .execute()
             if client_res.data:
                 query = query.eq("client_id", client_res.data[0]["id"])
@@ -359,25 +341,31 @@ async def get_logs(
         response = query.execute()
         return {"success": True, "logs": response.data}
     except Exception as e:
+        print(f"Get logs error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/command")
 async def send_command(data: CommandRequest, _: dict = Depends(authenticate_user)):
     """Send command to client"""
     try:
-        db = get_supabase()
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Database not initialized")
         
         # Get client ID
-        client_res = db.table("clients").select("id").eq("client_id", data.client_id).execute()
+        client_res = supabase.table("clients") \
+            .select("id") \
+            .eq("client_id", data.client_id) \
+            .execute()
+        
         if not client_res.data:
             raise HTTPException(status_code=404, detail="Client not found")
         
         # Create command record
-        command_res = db.table("commands").insert({
+        command_res = supabase.table("commands").insert({
             "client_id": client_res.data[0]["id"],
             "command": data.command,
-            "status": "pending",
-            "parameters": data.parameters
+            "parameters": data.parameters,
+            "status": "pending"
         }).execute()
         
         # Try to send via WebSocket
@@ -388,14 +376,15 @@ async def send_command(data: CommandRequest, _: dict = Depends(authenticate_user
                 "command": data.command,
                 "parameters": data.parameters
             })
-        except:
-            pass  # WebSocket might not be connected
+        except Exception as e:
+            print(f"WebSocket send error: {str(e)}")
         
         return {"success": True, "command_id": command_res.data[0]["id"]}
         
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Send command error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/screenshot/{client_id}")
@@ -415,22 +404,23 @@ async def request_screenshot(client_id: str, _: dict = Depends(authenticate_user
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/upload-screenshot")
-async def upload_screenshot(
-    client_id: str,
-    image_data: str,
-    _: dict = Depends(authenticate_user)
-):
+async def upload_screenshot(client_id: str, image_data: str, _: dict = Depends(authenticate_user)):
     """Upload screenshot from client"""
     try:
-        db = get_supabase()
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Database not initialized")
         
         # Get client ID
-        client_res = db.table("clients").select("id").eq("client_id", client_id).execute()
+        client_res = supabase.table("clients") \
+            .select("id") \
+            .eq("client_id", client_id) \
+            .execute()
+        
         if not client_res.data:
             raise HTTPException(status_code=404, detail="Client not found")
         
         # Store screenshot
-        db.table("screenshots").insert({
+        supabase.table("screenshots").insert({
             "client_id": client_res.data[0]["id"],
             "image_data": image_data
         }).execute()
@@ -475,8 +465,9 @@ async def websocket_admin(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_json()
-            # Handle admin messages
-    except:
+            print(f"Admin WebSocket message: {data}")
+    except Exception as e:
+        print(f"Admin WebSocket error: {str(e)}")
         manager.disconnect("admin")
 
 @app.websocket("/ws/client/{client_id}")
@@ -484,61 +475,68 @@ async def websocket_client(websocket: WebSocket, client_id: str):
     await manager.connect_client(websocket, client_id)
     try:
         # Update client status
-        try:
-            db = get_supabase()
-            db.table("clients").update({
-                "online": True,
-                "last_seen": datetime.utcnow().isoformat()
-            }).eq("client_id", client_id).execute()
-        except:
-            pass  # DB might not be ready
+        if supabase:
+            try:
+                supabase.table("clients").update({
+                    "online": True,
+                    "last_seen": datetime.utcnow().isoformat()
+                }).eq("client_id", client_id).execute()
+            except:
+                pass
         
         while True:
             data = await websocket.receive_json()
             
             if data.get("type") == "heartbeat":
                 # Update last seen
-                try:
-                    db = get_supabase()
-                    db.table("clients").update({
-                        "last_seen": datetime.utcnow().isoformat(),
-                        "online": True
-                    }).eq("client_id", client_id).execute()
-                except:
-                    pass
+                if supabase:
+                    try:
+                        supabase.table("clients").update({
+                            "last_seen": datetime.utcnow().isoformat(),
+                            "online": True
+                        }).eq("client_id", client_id).execute()
+                    except:
+                        pass
                 
             elif data.get("type") == "command_result":
                 # Update command status
-                try:
-                    db = get_supabase()
-                    db.table("commands").update({
-                        "status": "completed",
-                        "result": data.get("result")
-                    }).eq("id", data.get("command_id")).execute()
-                except:
-                    pass
+                if supabase:
+                    try:
+                        supabase.table("commands").update({
+                            "status": "completed",
+                            "result": data.get("result"),
+                            "completed_at": datetime.utcnow().isoformat()
+                        }).eq("id", data.get("command_id")).execute()
+                    except:
+                        pass
                 
             elif data.get("type") == "log":
                 # Store log
-                try:
-                    db = get_supabase()
-                    client_res = db.table("clients").select("id").eq("client_id", client_id).execute()
-                    if client_res.data:
-                        db.table("logs").insert({
-                            "client_id": client_res.data[0]["id"],
-                            "log_type": data.get("log_type", "info"),
-                            "message": data.get("message")
-                        }).execute()
-                except:
-                    pass
+                if supabase:
+                    try:
+                        client_res = supabase.table("clients") \
+                            .select("id") \
+                            .eq("client_id", client_id) \
+                            .execute()
+                        if client_res.data:
+                            supabase.table("logs").insert({
+                                "client_id": client_res.data[0]["id"],
+                                "log_type": data.get("log_type", "info"),
+                                "message": data.get("message", "")
+                            }).execute()
+                    except:
+                        pass
                     
-    except:
+    except Exception as e:
+        print(f"Client WebSocket error: {str(e)}")
         # Mark client as offline
-        try:
-            db = get_supabase()
-            db.table("clients").update({"online": False}).eq("client_id", client_id).execute()
-        except:
-            pass
+        if supabase:
+            try:
+                supabase.table("clients").update({
+                    "online": False
+                }).eq("client_id", client_id).execute()
+            except:
+                pass
         manager.disconnect(client_id)
 
 @app.get("/api/health")
@@ -554,7 +552,6 @@ async def health_check():
     # Test database connection if available
     if supabase:
         try:
-            # Simple query to test connection
             supabase.table("users").select("count", count="exact").limit(1).execute()
             health_status["database"] = "connected"
         except Exception as e:
@@ -573,19 +570,16 @@ async def root():
         "database": "initialized" if supabase else "not initialized"
     }
 
-@app.get("/api/debug/env")
-async def debug_env():
-    """Debug endpoint to check environment variables (remove in production)"""
-    return {
-        "SUPABASE_URL_set": bool(SUPABASE_URL),
-        "SUPABASE_KEY_set": bool(SUPABASE_KEY),
-        "ADMIN_PASSWORD_set": bool(ADMIN_INITIAL_PASSWORD),
-        "supabase_initialized": supabase is not None
-    }
-
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    print(f"Starting server on port {port}")
-    print(f"Supabase URL: {SUPABASE_URL}")
-    print(f"JWT Secret present: {bool(JWT_SECRET_KEY)}")
+    print(f"🚀 Starting server on port {port}")
+    print(f"🔗 Supabase URL: {SUPABASE_URL}")
+    print(f"🔑 JWT Secret: {'Set' if JWT_SECRET_KEY else 'Not set'}")
+    print(f"👑 Admin Password: {'Set' if ADMIN_INITIAL_PASSWORD else 'Using default'}")
+    print("\n📋 Available endpoints:")
+    print(f"   • Login: POST /api/login")
+    print(f"   • Clients: GET /api/clients")
+    print(f"   • Health: GET /api/health")
+    print(f"   • Docs: http://localhost:{port}/docs")
+    
     uvicorn.run(app, host="0.0.0.0", port=port)
