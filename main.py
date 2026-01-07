@@ -1090,12 +1090,5 @@ if __name__ == "__main__":
     print(f"🌐 WebSocket endpoints:")
     print(f"   • Admin: ws://localhost:{PORT}/ws/admin")
     print(f"   • Client: ws://localhost:{PORT}/ws/client/{{client_id}}")
-    
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=PORT,
-        reload=True,
-        log_level="info"
-    )
+
 
