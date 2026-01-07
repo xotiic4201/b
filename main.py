@@ -1275,8 +1275,4 @@ async def startup_event():
     print(f"   • Client: ws://localhost:{PORT}/ws/client/{{client_id}}")
     print(f"📚 Documentation: http://localhost:{PORT}/docs")
 
-# This allows the app to be run directly or imported
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
