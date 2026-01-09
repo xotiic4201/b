@@ -116,7 +116,7 @@ class Database:
     def _get_database_url(self):
         """Get database connection string from environment"""
         # 1. Try DATABASE_URL first
-        db_url = os.getenv("DATABASE_URL")
+        db_url = os.getenv("https://ugaeaekzhocwqdzdtrry.supabase.co")
         if db_url:
             if db_url.startswith("postgresql://"):
                 return db_url
@@ -1595,3 +1595,4 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
