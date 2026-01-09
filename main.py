@@ -49,7 +49,7 @@ app.add_middleware(
 )
 
 # ========== ENVIRONMENT VARIABLES ==========
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_URL = os.getenv("https://ugaeaekzhocwqdzdtrry.supabase.co", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", secrets.token_urlsafe(32))
 PORT = int(os.getenv("PORT", "8000"))
@@ -1595,4 +1595,5 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
 
