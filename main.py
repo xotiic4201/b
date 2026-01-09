@@ -15,7 +15,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # Load environment variables
-
+load_dotenv()
 
 # Create FastAPI app
 app = FastAPI(
@@ -53,32 +53,6 @@ security = HTTPBearer()
 class LoginRequest(BaseModel):
     email: str = Field(..., example="kizer")
     password: str = Field(..., example="kidraper67")
-
-class ClientRegister(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    name: str = Field(..., example="Office Computer")
-    ip_address: str = Field(..., example="192.168.1.100")
-    os_info: str = Field(default="Windows", example="Windows 11")
-
-class CommandRequest(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    command: str = Field(..., example="get_processes")
-    parameters: Dict[str, Any] = Field(default_factory=dict)
-
-class ScreenshotUpload(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    image_data: str = Field(..., description="Base64 encoded image")
-    filename: str = Field(..., example="screenshot_2024.png")
-
-class AudioUpload(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    audio_data: str = Field(..., description="Base64 encoded audio")
-    filename: str = Field(..., example="recording_2024.mp3")
-
-class LogEntry(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    log_type: str = Field(..., example="info")
-    message: str = Field(..., example="System started")
 
 # ========== SECURITY FUNCTIONS ==========
 def create_jwt_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -122,36 +96,22 @@ def get_db_connection():
     
     if db_conn is None or db_conn.closed:
         try:
-            # Get connection string from environment
-            db_url = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
+            # Try DATABASE_URL first, then SUPABASE_URL
+            db_url = DATABASE_URL or SUPABASE_URL
             
             if not db_url:
                 print("⚠️ No database URL provided")
                 return None
             
-            # Debug: Print the URL (remove this in production)
-            print(f"🔧 Database URL: {db_url[:50]}...")
-            
             # Ensure proper connection string format
-            # Supabase typically uses: postgresql://postgres:[YOUR-PASSWORD]@[YOUR-HOST]:5432/postgres
-            if not db_url.startswith("postgresql://") and not db_url.startswith("postgres://"):
-                print(f"❌ Invalid database URL format. Must start with 'postgresql://' or 'postgres://'")
-                return None
+            if db_url.startswith("postgresql://"):
+                db_url = db_url.replace("postgresql://", "postgres://")
             
-            # Connect to database
-            db_conn = psycopg2.connect(
-                db_url,
-                cursor_factory=RealDictCursor,
-                connect_timeout=10  # 10 second timeout
-            )
-            print(f"✅ Database connected successfully")
-            return db_conn
+            db_conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+            print(f"✅ Database connected")
             
-        except psycopg2.OperationalError as e:
-            print(f"❌ Database connection failed: {e}")
-            return None
         except Exception as e:
-            print(f"❌ Unexpected database error: {e}")
+            print(f"❌ Database connection error: {e}")
             return None
     
     return db_conn
@@ -1289,4 +1249,7 @@ async def startup_event():
     print(f"   • Client: ws://localhost:{PORT}/ws/client/{{client_id}}")
     print(f"📚 Documentation: http://localhost:{PORT}/docs")
 
-
+# This allows the app to be run directly or imported
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
