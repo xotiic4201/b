@@ -237,11 +237,19 @@ class SystemInfo(BaseModel):
     client_id: str = Field(..., example="client-001", min_length=1)
     info: Dict[str, Any] = Field(..., description="System information JSON")
 
+# FIXED: Use pattern instead of regex
 class PaginationParams(BaseModel):
     page: int = Field(default=1, ge=1)
     limit: int = Field(default=50, ge=1, le=1000)
     sort_by: str = Field(default="created_at")
-    sort_order: str = Field(default="desc", regex="^(asc|desc)$")
+    
+    @validator('sort_order')
+    def validate_sort_order(cls, v):
+        if v not in ['asc', 'desc']:
+            raise ValueError('sort_order must be "asc" or "desc"')
+        return v
+    
+    sort_order: str = Field(default="desc")
 
 # ========== SECURITY FUNCTIONS ==========
 def create_jwt_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -361,13 +369,13 @@ def get_client_by_id(client_identifier: str):
 class ConnectionManager:
     def __init__(self):
         self.client_connections: Dict[str, WebSocket] = {}
-        self.admin_connections: List[WebSocket] = {}
+        self.admin_connections: List[WebSocket] = []
         self.connection_times: Dict[str, datetime] = {}
         
     async def connect_admin(self, websocket: WebSocket, admin_id: str = None):
         await websocket.accept()
         admin_id = admin_id or f"admin-{len(self.admin_connections)}"
-        self.admin_connections[admin_id] = websocket
+        self.admin_connections.append(websocket)
         self.connection_times[admin_id] = datetime.utcnow()
         logger.info(f"👑 Admin connected: {admin_id}. Total admins: {len(self.admin_connections)}")
         return admin_id
@@ -397,53 +405,58 @@ class ConnectionManager:
             "total_clients": len(self.client_connections)
         })
 
-    def disconnect(self, connection_id: str, is_admin: bool = False):
+    def disconnect(self, websocket: WebSocket):
         """Disconnect a client or admin"""
-        if is_admin:
-            if connection_id in self.admin_connections:
-                del self.admin_connections[connection_id]
-                if connection_id in self.connection_times:
-                    del self.connection_times[connection_id]
-                logger.info(f"👑 Admin disconnected: {connection_id}. Total admins: {len(self.admin_connections)}")
-        else:
-            if connection_id in self.client_connections:
-                del self.client_connections[connection_id]
-                if connection_id in self.connection_times:
-                    del self.connection_times[connection_id]
-                logger.info(f"🖥️  Client disconnected: {connection_id}. Total clients: {len(self.client_connections)}")
-                
-                # Update client status in database
-                try:
-                    with db.get_cursor() as cursor:
-                        cursor.execute("""
-                            UPDATE clients 
-                            SET online = false
-                            WHERE client_id = %s
-                        """, (connection_id,))
-                except Exception as e:
-                    logger.error(f"Client status update error: {e}")
-                
-                # Notify admins
-                asyncio.create_task(self.notify_admins({
-                    "type": "client_disconnected",
-                    "client_id": connection_id,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "total_clients": len(self.client_connections)
-                }))
+        # Check if it's an admin
+        if websocket in self.admin_connections:
+            self.admin_connections.remove(websocket)
+            logger.info(f"👑 Admin disconnected. Total admins: {len(self.admin_connections)}")
+            return
+        
+        # Check if it's a client
+        client_id = None
+        for cid, ws in self.client_connections.items():
+            if ws == websocket:
+                client_id = cid
+                break
+        
+        if client_id:
+            del self.client_connections[client_id]
+            logger.info(f"🖥️  Client disconnected: {client_id}. Total clients: {len(self.client_connections)}")
+            
+            # Update client status in database
+            try:
+                with db.get_cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE clients 
+                        SET online = false
+                        WHERE client_id = %s
+                    """, (client_id,))
+            except Exception as e:
+                logger.error(f"Client status update error: {e}")
+            
+            # Notify admins
+            asyncio.create_task(self.notify_admins({
+                "type": "client_disconnected",
+                "client_id": client_id,
+                "timestamp": datetime.utcnow().isoformat(),
+                "total_clients": len(self.client_connections)
+            }))
 
     async def notify_admins(self, message: dict):
         """Send message to all admin connections"""
         disconnected = []
-        for admin_id, connection in self.admin_connections.items():
+        for connection in self.admin_connections:
             try:
                 await connection.send_json(message)
             except Exception as e:
-                logger.error(f"Failed to send to admin {admin_id}: {e}")
-                disconnected.append(admin_id)
+                logger.error(f"Failed to send to admin: {e}")
+                disconnected.append(connection)
         
         # Remove disconnected admins
-        for admin_id in disconnected:
-            self.disconnect(admin_id, is_admin=True)
+        for connection in disconnected:
+            if connection in self.admin_connections:
+                self.admin_connections.remove(connection)
 
     async def send_to_client(self, client_id: str, message: dict) -> bool:
         """Send message to specific client"""
@@ -453,7 +466,9 @@ class ConnectionManager:
                 return True
             except Exception as e:
                 logger.error(f"Failed to send to client {client_id}: {e}")
-                self.disconnect(client_id)
+                # Remove disconnected client
+                if client_id in self.client_connections:
+                    del self.client_connections[client_id]
                 return False
         return False
     
@@ -461,23 +476,16 @@ class ConnectionManager:
         """Get connection statistics"""
         now = datetime.utcnow()
         client_uptimes = {}
-        admin_uptimes = {}
         
         for client_id, connect_time in self.connection_times.items():
             if client_id in self.client_connections:
                 uptime = (now - connect_time).total_seconds()
                 client_uptimes[client_id] = uptime
         
-        for admin_id, connect_time in self.connection_times.items():
-            if admin_id in self.admin_connections:
-                uptime = (now - connect_time).total_seconds()
-                admin_uptimes[admin_id] = uptime
-        
         return {
             "total_clients": len(self.client_connections),
             "total_admins": len(self.admin_connections),
-            "client_uptimes": client_uptimes,
-            "admin_uptimes": admin_uptimes
+            "client_uptimes": client_uptimes
         }
 
 manager = ConnectionManager()
@@ -1288,11 +1296,11 @@ async def websocket_admin(websocket: WebSocket):
                 
     except WebSocketDisconnect:
         if admin_id:
-            manager.disconnect(admin_id, is_admin=True)
+            manager.disconnect(websocket)
     except Exception as e:
         logger.error(f"Admin WebSocket error: {e}")
         if admin_id:
-            manager.disconnect(admin_id, is_admin=True)
+            manager.disconnect(websocket)
 
 @app.websocket("/ws/client/{client_id}")
 async def websocket_client(websocket: WebSocket, client_id: str):
@@ -1425,10 +1433,10 @@ async def websocket_client(websocket: WebSocket, client_id: str):
                 })
                 
     except WebSocketDisconnect:
-        manager.disconnect(client_id)
+        manager.disconnect(websocket)
     except Exception as e:
         logger.error(f"Client WebSocket error: {e}")
-        manager.disconnect(client_id)
+        manager.disconnect(websocket)
 
 # ========== HEALTH AND INFO ==========
 @app.get("/api/health", response_model=dict)
@@ -1570,10 +1578,10 @@ async def shutdown_event():
     
     # Close all WebSocket connections
     for client_id in list(manager.client_connections.keys()):
-        manager.disconnect(client_id)
+        manager.disconnect(manager.client_connections[client_id])
     
-    for admin_id in list(manager.admin_connections.keys()):
-        manager.disconnect(admin_id, is_admin=True)
+    for connection in manager.admin_connections:
+        manager.disconnect(connection)
     
     logger.info("✅ Application shutdown complete")
 
