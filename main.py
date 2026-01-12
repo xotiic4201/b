@@ -1,10 +1,10 @@
 import os
 import sys
 import logging
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, status, Query
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, status, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
@@ -17,6 +17,8 @@ import time
 from supabase import create_client, Client
 import base64
 import hashlib
+import mimetypes
+import io
 
 # ========== CONFIGURATION ==========
 logging.basicConfig(
@@ -109,6 +111,19 @@ class ScreenshotRequest(BaseModel):
 class SystemInfoRequest(BaseModel):
     client_id: str = Field(..., example="client-001")
     info: Dict[str, Any] = Field(default_factory=dict)
+
+class ChatMessage(BaseModel):
+    message: str = Field(..., description="Message content")
+    recipient: Optional[str] = Field(None, description="Recipient user ID (null for all)")
+    file_data: Optional[str] = Field(None, description="Base64 encoded file data")
+    file_name: Optional[str] = Field(None, description="File name")
+    file_type: Optional[str] = Field(None, description="File type")
+    is_voice_note: bool = Field(default=False)
+
+class UserTag(BaseModel):
+    user_id: str
+    role: str = Field(..., description="owner, sr_admin, admin, user")
+    color: Optional[str] = Field("#8a2be2", description="Tag color")
 
 # ========== SECURITY FUNCTIONS ==========
 def create_jwt_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -266,7 +281,11 @@ class Database:
         self.commands = []
         self.logs = []
         self.sessions = {}
+        self.chat_messages = []
+        self.user_tags = {}
+        self.files = {}
         self.init_default_data()
+        self.init_user_tags()
     
     def init_default_data(self):
         # Default users - with special theme for Nathan
@@ -316,34 +335,28 @@ class Database:
         for user in default_users:
             self.users[user["email"].lower()] = user
         
-        # Add some sample clients
-        sample_clients = [
-            {
-                "id": str(uuid.uuid4()),
-                "client_id": "client-001",
-                "name": "Main Server",
-                "ip_address": "192.168.1.100",
-                "os_info": "Ubuntu 22.04",
-                "online": False,
-                "ws_online": False,
-                "last_seen": datetime.utcnow().isoformat(),
-                "registered_at": datetime.utcnow().isoformat()
-            },
-            {
-                "id": str(uuid.uuid4()),
-                "client_id": "client-002",
-                "name": "Office PC",
-                "ip_address": "192.168.1.101",
-                "os_info": "Windows 11",
-                "online": False,
-                "ws_online": False,
-                "last_seen": datetime.utcnow().isoformat(),
-                "registered_at": datetime.utcnow().isoformat()
-            }
-        ]
         
-        for client in sample_clients:
-            self.clients[client["client_id"]] = client
+    
+    def init_user_tags(self):
+        # Special user tags
+        self.user_tags["xotiic"] = {
+            "user_id": "xotiic",
+            "role": "owner",
+            "color": "#ff0000",
+            "can_create_accounts": True
+        }
+        self.user_tags["kizer"] = {
+            "user_id": "kizer",
+            "role": "sr_admin",
+            "color": "#ff9900",
+            "can_create_accounts": False
+        }
+        self.user_tags["nathan"] = {
+            "user_id": "nathan",
+            "role": "admin",
+            "color": "#9d65ff",
+            "can_create_accounts": False
+        }
     
     def get_user_by_email(self, email: str):
         return self.users.get(email.lower())
@@ -352,6 +365,17 @@ class Database:
         user = self.get_user_by_email(email)
         if user:
             user["last_login"] = datetime.utcnow().isoformat()
+    
+    def add_chat_message(self, message_data: dict):
+        message_id = str(uuid.uuid4())
+        message_data["id"] = message_id
+        message_data["timestamp"] = datetime.utcnow().isoformat()
+        message_data["read_by"] = [message_data["sender"]]
+        self.chat_messages.append(message_data)
+        return message_data
+    
+    def get_user_tag(self, user_id: str):
+        return self.user_tags.get(user_id.lower())
 
 # Initialize database
 db = Database()
@@ -361,6 +385,7 @@ class ConnectionManager:
     def __init__(self):
         self.client_connections: Dict[str, WebSocket] = {}
         self.admin_connections: List[WebSocket] = []
+        self.chat_connections: Dict[str, WebSocket] = {}  # user_id -> WebSocket
 
     async def connect_admin(self, websocket: WebSocket):
         await websocket.accept()
@@ -399,6 +424,64 @@ class ConnectionManager:
             "timestamp": datetime.utcnow().isoformat(),
             "total_clients": len(self.client_connections)
         })
+
+    async def connect_chat(self, websocket: WebSocket, user_id: str):
+        await websocket.accept()
+        self.chat_connections[user_id] = websocket
+        logger.info(f"💬 Chat connected: {user_id}. Total chat users: {len(self.chat_connections)}")
+        
+        # Notify others about user online status
+        await self.broadcast_chat({
+            "type": "user_online",
+            "user_id": user_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }, exclude_user=user_id)
+        
+        # Send initial messages
+        await self.send_chat_history(user_id)
+        await self.send_user_list(user_id)
+    
+    async def send_chat_history(self, user_id: str):
+        """Send chat history to user"""
+        if user_id in self.chat_connections:
+            try:
+                # Get last 50 messages
+                messages = db.chat_messages[-50:] if len(db.chat_messages) > 50 else db.chat_messages
+                
+                await self.chat_connections[user_id].send_json({
+                    "type": "chat_history",
+                    "messages": messages,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            except Exception as e:
+                logger.error(f"Error sending chat history: {e}")
+    
+    async def send_user_list(self, user_id: str):
+        """Send online user list"""
+        if user_id in self.chat_connections:
+            try:
+                online_users = list(self.chat_connections.keys())
+                user_data = []
+                
+                for uid in online_users:
+                    user = db.get_user_by_email(uid) or next((u for u in db.users.values() if u["email"] == uid), None)
+                    if user:
+                        tag = db.get_user_tag(user["email"])
+                        user_data.append({
+                            "user_id": user["email"],
+                            "username": user["email"],
+                            "role": tag["role"] if tag else "user",
+                            "color": tag["color"] if tag else "#8a2be2",
+                            "online": True
+                        })
+                
+                await self.chat_connections[user_id].send_json({
+                    "type": "user_list",
+                    "users": user_data,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            except Exception as e:
+                logger.error(f"Error sending user list: {e}")
 
     def disconnect(self, websocket: WebSocket):
         # Remove from admin connections
@@ -441,6 +524,24 @@ class ConnectionManager:
                 "timestamp": datetime.utcnow().isoformat(),
                 "total_clients": len(self.client_connections)
             }))
+        
+        # Remove from chat connections
+        chat_user_id = None
+        for uid, ws in self.chat_connections.items():
+            if ws == websocket:
+                chat_user_id = uid
+                break
+        
+        if chat_user_id:
+            del self.chat_connections[chat_user_id]
+            logger.info(f"💬 Chat disconnected: {chat_user_id}. Total chat users: {len(self.chat_connections)}")
+            
+            # Notify others about user offline status
+            asyncio.create_task(self.broadcast_chat({
+                "type": "user_offline",
+                "user_id": chat_user_id,
+                "timestamp": datetime.utcnow().isoformat()
+            }))
 
     async def notify_admins(self, message: dict):
         """Send message to all admin connections"""
@@ -468,6 +569,33 @@ class ConnectionManager:
                 # Remove disconnected client
                 if client_id in self.client_connections:
                     del self.client_connections[client_id]
+                return False
+        return False
+    
+    async def broadcast_chat(self, message: dict, exclude_user: str = None):
+        """Send message to all chat users except specified user"""
+        disconnected = []
+        for uid, connection in self.chat_connections.items():
+            if uid != exclude_user:
+                try:
+                    await connection.send_json(message)
+                except Exception as e:
+                    logger.error(f"Failed to send chat to {uid}: {e}")
+                    disconnected.append(uid)
+        
+        # Remove disconnected users
+        for uid in disconnected:
+            if uid in self.chat_connections:
+                del self.chat_connections[uid]
+    
+    async def send_to_user(self, user_id: str, message: dict) -> bool:
+        """Send message to specific user"""
+        if user_id in self.chat_connections:
+            try:
+                await self.chat_connections[user_id].send_json(message)
+                return True
+            except Exception as e:
+                logger.error(f"Failed to send to user {user_id}: {e}")
                 return False
         return False
 
@@ -546,11 +674,11 @@ async def login(data: LoginRequest):
 
 @app.post("/api/create-account", response_model=dict)
 async def create_account(data: UserCreate, user: dict = Depends(authenticate_user)):
-    """Create a new user account (admin only)"""
+    """Create a new user account (xotiic only)"""
     try:
-        # Check if user is admin
-        if not user.get("is_admin"):
-            raise HTTPException(status_code=403, detail="Admin access required")
+        # Check if user is xotiic (owner)
+        if user.get("email") != "xotiic":
+            raise HTTPException(status_code=403, detail="Only xotiic can create accounts")
         
         # Check if passwords match
         if data.password != data.confirm_password:
@@ -1200,6 +1328,7 @@ async def get_stats(user: dict = Depends(authenticate_user)):
         stats["total_users"] = max(stats["total_users"], len(db.users))
         
         stats["active_admins"] = len(manager.admin_connections)
+        stats["chat_users"] = len(manager.chat_connections)
         
         return {
             "success": True,
@@ -1207,6 +1336,360 @@ async def get_stats(user: dict = Depends(authenticate_user)):
         }
     except Exception as e:
         logger.error(f"Get stats error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# ========== CHAT API ENDPOINTS ==========
+@app.post("/api/chat/send", response_model=dict)
+async def send_chat_message(
+    data: ChatMessage,
+    user: dict = Depends(authenticate_user)
+):
+    """Send a chat message"""
+    try:
+        sender_id = user.get("email")
+        
+        # Check if recipient exists (if specified)
+        if data.recipient and data.recipient != "all":
+            recipient_user = db.get_user_by_email(data.recipient)
+            if not recipient_user:
+                raise HTTPException(status_code=404, detail="Recipient not found")
+        
+        # Create message data
+        message_data = {
+            "sender": sender_id,
+            "recipient": data.recipient,
+            "message": data.message,
+            "file_name": data.file_name,
+            "file_type": data.file_type,
+            "is_voice_note": data.is_voice_note,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        # Handle file upload
+        if data.file_data and data.file_name:
+            file_id = str(uuid.uuid4())
+            file_data = {
+                "id": file_id,
+                "message_id": None,  # Will be updated after message creation
+                "file_name": data.file_name,
+                "file_type": data.file_type,
+                "size": len(base64.b64decode(data.file_data)),
+                "uploader": sender_id,
+                "uploaded_at": datetime.utcnow().isoformat(),
+                "data": data.file_data  # Store base64 for now
+            }
+            db.files[file_id] = file_data
+            message_data["file_id"] = file_id
+        
+        # Add message to database
+        message_data = db.add_chat_message(message_data)
+        
+        # Update file with message ID
+        if "file_id" in message_data:
+            db.files[message_data["file_id"]]["message_id"] = message_data["id"]
+        
+        # Store in Supabase if available
+        if supabase:
+            try:
+                # Store message
+                supabase.table("chat_messages").insert({
+                    "id": message_data["id"],
+                    "sender": sender_id,
+                    "recipient": data.recipient,
+                    "message": data.message,
+                    "file_id": message_data.get("file_id"),
+                    "file_name": data.file_name,
+                    "file_type": data.file_type,
+                    "is_voice_note": data.is_voice_note,
+                    "timestamp": message_data["timestamp"]
+                }).execute()
+                
+                # Store file if exists
+                if "file_id" in message_data:
+                    supabase.table("chat_files").insert({
+                        "id": message_data["file_id"],
+                        "file_name": data.file_name,
+                        "file_type": data.file_type,
+                        "size": len(base64.b64decode(data.file_data)),
+                        "uploader": sender_id,
+                        "uploaded_at": datetime.utcnow().isoformat(),
+                        "data": data.file_data
+                    }).execute()
+                    
+            except Exception as e:
+                logger.error(f"Supabase chat storage error: {e}")
+        
+        # Get sender tag
+        sender_tag = db.get_user_tag(sender_id) or {"role": "user", "color": "#8a2be2"}
+        
+        # Broadcast message
+        broadcast_data = {
+            "type": "new_message",
+            "message": message_data,
+            "sender_tag": sender_tag
+        }
+        
+        if data.recipient == "all" or not data.recipient:
+            # Broadcast to all
+            await manager.broadcast_chat(broadcast_data, exclude_user=sender_id)
+        else:
+            # Send to specific recipient
+            await manager.send_to_user(data.recipient, broadcast_data)
+        
+        # Also send to sender for their own chat
+        await manager.send_to_user(sender_id, broadcast_data)
+        
+        return {
+            "success": True,
+            "message_id": message_data["id"],
+            "timestamp": message_data["timestamp"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Send chat message error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/chat/messages", response_model=dict)
+async def get_chat_messages(
+    user: dict = Depends(authenticate_user),
+    limit: int = Query(100, ge=1, le=1000),
+    before: Optional[str] = Query(None)
+):
+    """Get chat messages"""
+    try:
+        user_id = user.get("email")
+        messages = []
+        
+        # Get from Supabase if available
+        if supabase:
+            query = supabase.table("chat_messages").select("*")
+            
+            # Filter messages visible to user
+            query = query.or_(f"recipient.eq.{user_id},recipient.is.null,recipient.eq.all,sender.eq.{user_id}")
+            
+            if before:
+                query = query.lt("timestamp", before)
+            
+            response = query.order("timestamp", desc=True).limit(limit).execute()
+            
+            if response.data:
+                messages = response.data
+        else:
+            # Fallback to in-memory
+            messages = db.chat_messages.copy()
+            
+            # Filter messages visible to user
+            messages = [
+                msg for msg in messages
+                if (msg["recipient"] in [user_id, "all", None] or 
+                    msg["sender"] == user_id or 
+                    user_id in msg.get("read_by", []))
+            ]
+            
+            if before:
+                messages = [msg for msg in messages if msg["timestamp"] < before]
+            
+            messages.sort(key=lambda x: x["timestamp"], reverse=True)
+            messages = messages[:limit]
+        
+        # Add user tags to messages
+        for msg in messages:
+            sender_tag = db.get_user_tag(msg["sender"])
+            if sender_tag:
+                msg["sender_tag"] = sender_tag
+        
+        return {
+            "success": True,
+            "messages": messages[::-1],  # Return in chronological order
+            "total": len(messages)
+        }
+        
+    except Exception as e:
+        logger.error(f"Get chat messages error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/chat/users", response_model=dict)
+async def get_chat_users(user: dict = Depends(authenticate_user)):
+    """Get online chat users"""
+    try:
+        online_users = list(manager.chat_connections.keys())
+        user_data = []
+        
+        # Get all users from database
+        all_users = []
+        if supabase:
+            response = supabase.table("users")\
+                .select("email, is_admin, is_active")\
+                .eq("is_active", True)\
+                .execute()
+            if response.data:
+                all_users = response.data
+        else:
+            all_users = list(db.users.values())
+        
+        # Add global chat user
+        user_data.append({
+            "user_id": "all",
+            "username": "Global Chat",
+            "role": "global",
+            "color": "#00ffff",
+            "online": True,
+            "last_seen": datetime.utcnow().isoformat()
+        })
+        
+        # Prepare user data with tags
+        for user_obj in all_users:
+            user_email = user_obj["email"]
+            if user_email == user.get("email"):
+                continue  # Skip current user
+                
+            tag = db.get_user_tag(user_email)
+            
+            user_data.append({
+                "user_id": user_email,
+                "username": user_email,
+                "role": tag["role"] if tag else "user",
+                "color": tag["color"] if tag else "#8a2be2",
+                "online": user_email in online_users,
+                "last_seen": user_obj.get("last_login")
+            })
+        
+        return {
+            "success": True,
+            "users": user_data
+        }
+        
+    except Exception as e:
+        logger.error(f"Get chat users error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/chat/upload-file", response_model=dict)
+async def upload_chat_file(
+    file: UploadFile = File(...),
+    user: dict = Depends(authenticate_user)
+):
+    """Upload a file for chat"""
+    try:
+        # Read file
+        contents = await file.read()
+        
+        # Convert to base64
+        file_data = base64.b64encode(contents).decode('utf-8')
+        
+        # Determine file type
+        file_type = file.content_type or mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
+        
+        # Store file
+        file_id = str(uuid.uuid4())
+        file_record = {
+            "id": file_id,
+            "file_name": file.filename,
+            "file_type": file_type,
+            "size": len(contents),
+            "uploader": user.get("email"),
+            "uploaded_at": datetime.utcnow().isoformat(),
+            "data": file_data
+        }
+        
+        db.files[file_id] = file_record
+        
+        # Store in Supabase
+        if supabase:
+            try:
+                supabase.table("chat_files").insert({
+                    "id": file_id,
+                    "file_name": file.filename,
+                    "file_type": file_type,
+                    "size": len(contents),
+                    "uploader": user.get("email"),
+                    "uploaded_at": datetime.utcnow().isoformat(),
+                    "data": file_data
+                }).execute()
+            except Exception as e:
+                logger.error(f"Supabase file storage error: {e}")
+        
+        return {
+            "success": True,
+            "file_id": file_id,
+            "file_name": file.filename,
+            "file_type": file_type,
+            "size": len(contents),
+            "download_url": f"/api/chat/download/{file_id}"
+        }
+        
+    except Exception as e:
+        logger.error(f"File upload error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/chat/download/{file_id}")
+async def download_chat_file(
+    file_id: str,
+    user: dict = Depends(authenticate_user)
+):
+    """Download a chat file"""
+    try:
+        # Get file from database
+        if supabase:
+            response = supabase.table("chat_files")\
+                .select("*")\
+                .eq("id", file_id)\
+                .execute()
+            
+            if not response.data:
+                raise HTTPException(status_code=404, detail="File not found")
+            
+            file_record = response.data[0]
+        else:
+            file_record = db.files.get(file_id)
+            if not file_record:
+                raise HTTPException(status_code=404, detail="File not found")
+        
+        # Decode base64 data
+        file_data = base64.b64decode(file_record["data"])
+        
+        # Return file
+        return StreamingResponse(
+            io.BytesIO(file_data),
+            media_type=file_record["file_type"],
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_record["file_name"]}"'
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"File download error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/chat/mark-read/{message_id}", response_model=dict)
+async def mark_message_read(
+    message_id: str,
+    user: dict = Depends(authenticate_user)
+):
+    """Mark a message as read"""
+    try:
+        user_id = user.get("email")
+        
+        # Update in memory
+        for msg in db.chat_messages:
+            if msg["id"] == message_id and user_id not in msg.get("read_by", []):
+                msg.setdefault("read_by", []).append(user_id)
+                break
+        
+        # Update Supabase
+        if supabase:
+            try:
+                # This would need a more complex update in Supabase
+                # For simplicity, we'll just log it
+                logger.info(f"User {user_id} read message {message_id}")
+            except Exception as e:
+                logger.error(f"Supabase read update error: {e}")
+        
+        return {"success": True}
+        
+    except Exception as e:
+        logger.error(f"Mark read error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # ========== HEALTH AND INFO ==========
@@ -1221,6 +1704,7 @@ async def health_check():
             "database": "Supabase + In-Memory" if supabase else "In-Memory",
             "active_clients": len(manager.client_connections),
             "active_admins": len(manager.admin_connections),
+            "chat_users": len(manager.chat_connections),
             "total_users": len(db.users),
             "total_clients": len(db.clients),
             "supabase_connected": supabase is not None
@@ -1461,6 +1945,61 @@ async def websocket_client(websocket: WebSocket, client_id: str):
             db.clients[client_id]["ws_online"] = False
         manager.disconnect(websocket)
 
+@app.websocket("/ws/chat/{user_id}")
+async def websocket_chat(websocket: WebSocket, user_id: str):
+    """WebSocket endpoint for chat"""
+    try:
+        await manager.connect_chat(websocket, user_id)
+        
+        while True:
+            try:
+                data = await websocket.receive_json()
+                data_type = data.get("type")
+                
+                if data_type == "ping":
+                    await websocket.send_json({
+                        "type": "pong",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    
+                elif data_type == "typing":
+                    # Broadcast typing indicator
+                    await manager.broadcast_chat({
+                        "type": "user_typing",
+                        "user_id": user_id,
+                        "is_typing": data.get("is_typing", False),
+                        "timestamp": datetime.utcnow().isoformat()
+                    }, exclude_user=user_id)
+                    
+                elif data_type == "read_receipt":
+                    # Handle read receipts
+                    message_id = data.get("message_id")
+                    if message_id:
+                        for msg in db.chat_messages:
+                            if msg["id"] == message_id and user_id not in msg.get("read_by", []):
+                                msg.setdefault("read_by", []).append(user_id)
+                                
+                                # Broadcast read receipt
+                                await manager.broadcast_chat({
+                                    "type": "message_read",
+                                    "message_id": message_id,
+                                    "user_id": user_id,
+                                    "timestamp": datetime.utcnow().isoformat()
+                                })
+                                break
+                    
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"Chat WebSocket error: {e}")
+                continue
+                
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"Chat WebSocket error: {e}")
+        manager.disconnect(websocket)
+
 # ========== ERROR HANDLERS ==========
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -1508,7 +2047,8 @@ async def serve_frontend():
                 "docs": "/docs",
                 "health": "/api/health",
                 "ws_admin": "/ws/admin",
-                "ws_client": "/ws/client/{client_id}"
+                "ws_client": "/ws/client/{client_id}",
+                "ws_chat": "/ws/chat/{user_id}"
             },
             "note": "Place frontend.html in the same directory to serve the web interface"
         })
@@ -1525,12 +2065,14 @@ async def startup_event():
     logger.info("🔗 WebSocket endpoints:")
     logger.info("   • Admin: /ws/admin")
     logger.info("   • Client: /ws/client/{client_id}")
+    logger.info("   • Chat: /ws/chat/{user_id}")
     logger.info("📚 Documentation: /docs")
     logger.info("👤 Default users:")
-    logger.info("   • xotiic/40671Mps19* (Admin)")
+    logger.info("   • xotiic/40671Mps19* (Owner) - Red tag")
     logger.info("   • admin/admin123 (Admin)")
-    logger.info("   • nathan/femboy67 (Admin with femboy theme)")
-    logger.info("   • kizer/kidraper67 (Admin)")
+    logger.info("   • nathan/femboy67 (Admin with femboy theme) - Purple tag")
+    logger.info("   • kizer/kidraper67 (Sr Admin) - Orange tag")
+    logger.info("💬 Chat system with file sharing enabled")
     logger.info("=" * 60)
     logger.info("✅ Application startup complete")
 
