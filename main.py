@@ -1837,24 +1837,6 @@ async def send_chat_message(data: ChatMessage, user: dict = Depends(authenticate
                 "timestamp": datetime.utcnow().isoformat()
             })
         
-        # Update conversations
-        if data.recipient and data.recipient != "all":
-            # Add to conversations list
-            conversation_exists = any(
-                conv for conv in chatState.conversations 
-                if conv.get("user_id") == data.recipient
-            )
-            if not conversation_exists:
-                # Get recipient user info
-                recipient_user = db.get_user_by_email(data.recipient)
-                if recipient_user:
-                    chatState.conversations.append({
-                        "user_id": data.recipient,
-                        "username": data.recipient,
-                        "online": data.recipient in manager.chat_connections,
-                        "role": "user"
-                    })
-        
         logger.info(f"💬 Chat message sent from {user_id} to {data.recipient or 'all'}")
         
         return {
@@ -1868,124 +1850,6 @@ async def send_chat_message(data: ChatMessage, user: dict = Depends(authenticate
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # ========== WEBSOCKET ENDPOINTS ==========
-
-# Add to the BackendWebSocket class in client code
-
-def handle_chat_message(self, data):
-    """Handle chat messages from admin"""
-    try:
-        message = data.get("message", "")
-        sender = data.get("sender", "Admin")
-        
-        if message and self.chat_popup:
-            self.chat_popup.receive_message(message, sender)
-            log_action(f"Received chat message from {sender}: {message[:50]}...")
-            
-            # Send acknowledgment
-            self.send_chat_acknowledgment(sender, message)
-            
-            # Auto-response for certain messages
-            self.handle_auto_response(message, sender)
-    except Exception as e:
-        log_action(f"Chat message error: {e}")
-
-def handle_auto_response(self, message, sender):
-    """Handle auto-responses to certain messages"""
-    try:
-        message_lower = message.lower()
-        
-        # Auto-responses
-        auto_responses = {
-            "hello": "Hello! Client is online and responsive.",
-            "ping": "Pong! Client is alive.",
-            "status": f"Client status: Online\nClient ID: {CLIENT_ID}\nSystem: {OS_INFO}",
-            "help": "Available commands: status, screenshot, system_info, restart"
-        }
-        
-        for keyword, response in auto_responses.items():
-            if keyword in message_lower:
-                # Send response back
-                if self.ws and self.connected:
-                    response_msg = {
-                        "type": "client_chat_response",
-                        "client_id": CLIENT_ID,
-                        "message": response,
-                        "original_message": message,
-                        "timestamp": datetime.utcnow().isoformat()
-                    }
-                    self.ws.send(json.dumps(response_msg))
-                break
-                
-    except Exception as e:
-        log_action(f"Auto-response error: {e}")
-
-# Update the on_message method to handle client_chat messages
-def on_message(self, ws, message):
-    """Handle incoming WebSocket messages"""
-    try:
-        data = json.loads(message)
-        
-        if data.get("type") == "command":
-            self.handle_command(data)
-        elif data.get("type") == "chat_message":
-            self.handle_chat_message(data)
-        elif data.get("type") == "client_chat":
-            # New: Handle direct chat messages from admin
-            self.handle_client_chat(data)
-        elif data.get("type") == "welcome":
-            log_action(f"[OK] Connected to server: {data.get('message')}")
-            self.reconnect_attempts = 0
-            
-    except Exception as e:
-        log_action(f"Message error: {e}")
-
-def handle_client_chat(self, data):
-    """Handle direct chat messages to client"""
-    try:
-        message = data.get("message", "")
-        from_user = data.get("from_user", "Admin")
-        
-        # Show in chat popup
-        if self.chat_popup:
-            self.chat_popup.receive_message(message, from_user)
-        
-        # Log it
-        log_action(f"Direct chat from {from_user}: {message}")
-        
-        # Send acknowledgment
-        if self.ws and self.connected:
-            ack = {
-                "type": "client_chat_ack",
-                "client_id": CLIENT_ID,
-                "message_received": message,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            self.ws.send(json.dumps(ack))
-            
-    except Exception as e:
-        log_action(f"Handle client chat error: {e}")
-
-# In the client WebSocket handler (websocket_client function), add:
-
-elif data_type == "client_chat_response":
-    # Forward client chat response to admins
-    await manager.notify_admins({
-        "type": "client_chat_response",
-        "client_id": client_id,
-        "message": data.get("message", ""),
-        "original_message": data.get("original_message", ""),
-        "timestamp": datetime.utcnow().isoformat()
-    })
-    
-elif data_type == "client_chat_ack":
-    # Acknowledge chat message receipt
-    await manager.notify_admins({
-        "type": "client_chat_ack",
-        "client_id": client_id,
-        "message_received": data.get("message_received", ""),
-        "timestamp": datetime.utcnow().isoformat()
-    })
-
 @app.websocket("/ws/admin")
 async def websocket_admin(websocket: WebSocket):
     """WebSocket endpoint for admin dashboard"""
@@ -2177,6 +2041,25 @@ async def websocket_client(websocket: WebSocket, client_id: str):
                         "timestamp": datetime.utcnow().isoformat()
                     })
                     
+                elif data_type == "client_chat_response":
+                    # Forward client chat response to admins
+                    await manager.notify_admins({
+                        "type": "client_chat_response",
+                        "client_id": client_id,
+                        "message": data.get("message", ""),
+                        "original_message": data.get("original_message", ""),
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    
+                elif data_type == "client_chat_ack":
+                    # Acknowledge chat message receipt
+                    await manager.notify_admins({
+                        "type": "client_chat_ack",
+                        "client_id": client_id,
+                        "message_received": data.get("message_received", ""),
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    
             except WebSocketDisconnect:
                 break
             except Exception as e:
@@ -2304,193 +2187,6 @@ async def serve_frontend():
             },
             "note": "Place frontend.html in the same directory to serve the web interface"
         })
-// Open client chat modal
-function openClientChat(clientId = null) {
-    const modal = document.getElementById('clientChatModal');
-    const select = document.getElementById('chatClientSelect');
-    
-    // Populate client dropdown
-    select.innerHTML = '<option value="">-- Select a client --</option>';
-    state.clients.forEach(client => {
-        const option = document.createElement('option');
-        option.value = client.client_id;
-        option.textContent = `${client.name} (${client.client_id.substring(0, 8)})`;
-        if (clientId && client.client_id === clientId) {
-            option.selected = true;
-        }
-        select.appendChild(option);
-    });
-    
-    // Clear previous data
-    document.getElementById('clientChatMessage').value = '';
-    document.getElementById('clientChatCommand').value = '';
-    document.getElementById('clientChatCommandParams').classList.add('hidden');
-    document.getElementById('clientChatResponse').classList.add('hidden');
-    
-    modal.style.display = 'flex';
-}
-
-// Close client chat modal
-function closeClientChat() {
-    document.getElementById('clientChatModal').style.display = 'none';
-}
-
-// Update command parameters based on type
-function updateClientChatCommand() {
-    const type = document.getElementById('clientChatCommandType').value;
-    const paramsDiv = document.getElementById('clientChatCommandParams');
-    const textarea = document.getElementById('clientChatCommand');
-    
-    if (type === 'message') {
-        paramsDiv.classList.add('hidden');
-        textarea.placeholder = 'Enter message...';
-    } else if (type === 'custom') {
-        paramsDiv.classList.remove('hidden');
-        textarea.placeholder = 'Enter custom command (e.g., "dir" or "ls -la")...';
-    } else if (type === 'python') {
-        paramsDiv.classList.remove('hidden');
-        textarea.placeholder = 'Enter Python code...';
-    } else {
-        paramsDiv.classList.add('hidden');
-        textarea.placeholder = 'Parameters will be added automatically...';
-    }
-}
-
-// Send message/command to client
-async function sendToClient() {
-    const clientId = document.getElementById('chatClientSelect').value;
-    const message = document.getElementById('clientChatMessage').value.trim();
-    const commandType = document.getElementById('clientChatCommandType').value;
-    const command = document.getElementById('clientChatCommand').value.trim();
-    
-    if (!clientId) {
-        showNotification('Please select a client', 'warning');
-        return;
-    }
-    
-    if (!message && commandType === 'message') {
-        showNotification('Please enter a message', 'warning');
-        return;
-    }
-    
-    showLoading('Sending to client...');
-    
-    try {
-        let response;
-        
-        if (commandType === 'message') {
-            // Send chat message via WebSocket to client
-            if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-                state.ws.send(JSON.stringify({
-                    type: 'client_chat',
-                    client_id: clientId,
-                    message: message,
-                    from_user: state.user.email,
-                    timestamp: new Date().toISOString()
-                }));
-                
-                showNotification(`Message sent to client: ${clientId}`, 'success');
-            } else {
-                throw new Error('WebSocket not connected');
-            }
-        } else {
-            // Send command
-            const parameters = {};
-            
-            switch (commandType) {
-                case 'custom':
-                    if (!command) {
-                        throw new Error('Please enter command');
-                    }
-                    parameters.code = command;
-                    break;
-                case 'python':
-                    if (!command) {
-                        throw new Error('Please enter Python code');
-                    }
-                    parameters.code = command;
-                    parameters.is_python = true;
-                    break;
-                case 'system_info':
-                case 'screenshot':
-                    // No additional parameters needed
-                    break;
-            }
-            
-            response = await fetch(`${CONFIG.BACKEND_URL}/api/command`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${state.token}`
-                },
-                body: JSON.stringify({
-                    client_id: clientId,
-                    command: commandType === 'python' ? 'custom' : commandType,
-                    parameters: parameters
-                })
-            });
-            
-            if (response.ok) {
-                const data = await response.json();
-                if (data.success) {
-                    showNotification(`Command sent to client: ${clientId}`, 'success');
-                    
-                    // Show response area
-                    document.getElementById('clientChatResponse').classList.remove('hidden');
-                    document.getElementById('clientChatOutput').textContent = 
-                        `Command sent successfully!\nCommand ID: ${data.command_id}`;
-                }
-            }
-        }
-        
-        // Add message to chat if there was one
-        if (message && commandType === 'message') {
-            // Add to our own chat view
-            const chatMessage = {
-                id: 'temp_' + Date.now(),
-                sender: state.user.email,
-                recipient: clientId,
-                message: `[To Client ${clientId}]: ${message}`,
-                timestamp: new Date().toISOString(),
-                sender_tag: db.get_user_tag?.(state.user.email) || { role: 'admin', color: '#8a2be2' }
-            };
-            
-            handleNewMessage(chatMessage, chatMessage.sender_tag);
-        }
-        
-    } catch (error) {
-        console.error('Send to client error:', error);
-        showNotification(`Failed to send to client: ${error.message}`, 'error');
-        
-        document.getElementById('clientChatResponse').classList.remove('hidden');
-        document.getElementById('clientChatOutput').textContent = `Error: ${error.message}`;
-    } finally {
-        hideLoading();
-    }
-}
-
-// Update backend WebSocket handler to include client_chat
-function handleWebSocketMessage(data) {
-    switch (data.type) {
-        // ... existing cases ...
-        
-        case 'client_chat_response':
-            showNotification(`Client ${data.client_id} responded: ${data.message.substring(0, 50)}...`, 'info');
-            
-            // Add to chat messages
-            const chatMessage = {
-                id: 'resp_' + Date.now(),
-                sender: data.client_id,
-                recipient: state.user.email,
-                message: `[From Client]: ${data.message}`,
-                timestamp: data.timestamp || new Date().toISOString(),
-                sender_tag: { role: 'client', color: '#00ff00' }
-            };
-            
-            handleNewMessage(chatMessage, chatMessage.sender_tag);
-            break;
-    }
-}
 
 # ========== APPLICATION STARTUP ==========
 @app.on_event("startup")
@@ -2524,5 +2220,3 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
-
-
