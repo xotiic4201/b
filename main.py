@@ -1338,115 +1338,149 @@ async def get_stats(user: dict = Depends(authenticate_user)):
         logger.error(f"Get stats error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# ========== CHAT API ENDPOINTS ==========
-@app.post("/api/chat/send", response_model=dict)
-async def send_chat_message(
-    data: ChatMessage,
-    user: dict = Depends(authenticate_user)
+# ========== UPDATE CHAT MESSAGES ENDPOINT ==========
+@app.get("/api/chat/messages", response_model=dict)
+async def get_chat_messages(
+    user: dict = Depends(authenticate_user),
+    recipient: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    before: Optional[str] = Query(None)
 ):
-    """Send a chat message"""
+    """Get chat messages with filtering"""
     try:
-        sender_id = user.get("email")
+        user_id = user.get("email")
+        messages = []
         
-        # Check if recipient exists (if specified)
-        if data.recipient and data.recipient != "all":
-            recipient_user = db.get_user_by_email(data.recipient)
-            if not recipient_user:
-                raise HTTPException(status_code=404, detail="Recipient not found")
-        
-        # Create message data
-        message_data = {
-            "sender": sender_id,
-            "recipient": data.recipient,
-            "message": data.message,
-            "file_name": data.file_name,
-            "file_type": data.file_type,
-            "is_voice_note": data.is_voice_note,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
-        # Handle file upload
-        if data.file_data and data.file_name:
-            file_id = str(uuid.uuid4())
-            file_data = {
-                "id": file_id,
-                "message_id": None,  # Will be updated after message creation
-                "file_name": data.file_name,
-                "file_type": data.file_type,
-                "size": len(base64.b64decode(data.file_data)),
-                "uploader": sender_id,
-                "uploaded_at": datetime.utcnow().isoformat(),
-                "data": data.file_data  # Store base64 for now
-            }
-            db.files[file_id] = file_data
-            message_data["file_id"] = file_id
-        
-        # Add message to database
-        message_data = db.add_chat_message(message_data)
-        
-        # Update file with message ID
-        if "file_id" in message_data:
-            db.files[message_data["file_id"]]["message_id"] = message_data["id"]
-        
-        # Store in Supabase if available
+        # Get from Supabase if available
         if supabase:
-            try:
-                # Store message
-                supabase.table("chat_messages").insert({
-                    "id": message_data["id"],
-                    "sender": sender_id,
-                    "recipient": data.recipient,
-                    "message": data.message,
-                    "file_id": message_data.get("file_id"),
-                    "file_name": data.file_name,
-                    "file_type": data.file_type,
-                    "is_voice_note": data.is_voice_note,
-                    "timestamp": message_data["timestamp"]
-                }).execute()
-                
-                # Store file if exists
-                if "file_id" in message_data:
-                    supabase.table("chat_files").insert({
-                        "id": message_data["file_id"],
-                        "file_name": data.file_name,
-                        "file_type": data.file_type,
-                        "size": len(base64.b64decode(data.file_data)),
-                        "uploader": sender_id,
-                        "uploaded_at": datetime.utcnow().isoformat(),
-                        "data": data.file_data
-                    }).execute()
-                    
-            except Exception as e:
-                logger.error(f"Supabase chat storage error: {e}")
-        
-        # Get sender tag
-        sender_tag = db.get_user_tag(sender_id) or {"role": "user", "color": "#8a2be2"}
-        
-        # Broadcast message
-        broadcast_data = {
-            "type": "new_message",
-            "message": message_data,
-            "sender_tag": sender_tag
-        }
-        
-        if data.recipient == "all" or not data.recipient:
-            # Broadcast to all
-            await manager.broadcast_chat(broadcast_data, exclude_user=sender_id)
+            query = supabase.table("chat_messages").select("*")
+            
+            # Filter messages based on recipient
+            if recipient:
+                if recipient == "all":
+                    # Global chat messages
+                    query = query.or_(f"recipient.eq.all,recipient.is.null")
+                else:
+                    # Private messages between users
+                    query = query.or_(
+                        f"and(sender.eq.{user_id},recipient.eq.{recipient})," +
+                        f"and(sender.eq.{recipient},recipient.eq.{user_id})"
+                    )
+            else:
+                # All messages visible to user
+                query = query.or_(
+                    f"recipient.eq.all,recipient.is.null," +
+                    f"recipient.eq.{user_id},sender.eq.{user_id}"
+                )
+            
+            if before:
+                query = query.lt("timestamp", before)
+            
+            response = query.order("timestamp", desc=True).limit(limit).execute()
+            
+            if response.data:
+                messages = response.data
         else:
-            # Send to specific recipient
-            await manager.send_to_user(data.recipient, broadcast_data)
+            # Fallback to in-memory
+            messages = db.chat_messages.copy()
+            
+            # Filter messages based on recipient
+            if recipient:
+                if recipient == "all":
+                    # Global chat messages
+                    messages = [
+                        msg for msg in messages
+                        if msg["recipient"] in ["all", None]
+                    ]
+                else:
+                    # Private messages between users
+                    messages = [
+                        msg for msg in messages
+                        if (msg["sender"] == user_id and msg["recipient"] == recipient) or
+                           (msg["sender"] == recipient and msg["recipient"] == user_id)
+                    ]
+            else:
+                # All messages visible to user
+                messages = [
+                    msg for msg in messages
+                    if (msg["recipient"] in [user_id, "all", None] or 
+                        msg["sender"] == user_id or 
+                        user_id in msg.get("read_by", []))
+                ]
+            
+            if before:
+                messages = [msg for msg in messages if msg["timestamp"] < before]
+            
+            messages.sort(key=lambda x: x["timestamp"], reverse=True)
+            messages = messages[:limit]
         
-        # Also send to sender for their own chat
-        await manager.send_to_user(sender_id, broadcast_data)
+        # Add user tags to messages
+        for msg in messages:
+            sender_tag = db.get_user_tag(msg["sender"])
+            if sender_tag:
+                msg["sender_tag"] = sender_tag
         
         return {
             "success": True,
-            "message_id": message_data["id"],
-            "timestamp": message_data["timestamp"]
+            "messages": messages[::-1],  # Return in chronological order
+            "total": len(messages)
         }
         
     except Exception as e:
-        logger.error(f"Send chat message error: {e}")
+        logger.error(f"Get chat messages error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# ========== ADD PRIVATE CONVERSATIONS ENDPOINT ==========
+@app.get("/api/chat/conversations", response_model=dict)
+async def get_conversations(user: dict = Depends(authenticate_user)):
+    """Get list of users you have conversations with"""
+    try:
+        user_id = user.get("email")
+        conversations = set()
+        
+        # Get from Supabase if available
+        if supabase:
+            # Get all messages involving this user
+            response = supabase.table("chat_messages")\
+                .select("sender, recipient")\
+                .or_(f"sender.eq.{user_id},recipient.eq.{user_id}")\
+                .execute()
+            
+            if response.data:
+                for msg in response.data:
+                    if msg["sender"] != user_id:
+                        conversations.add(msg["sender"])
+                    if msg["recipient"] and msg["recipient"] != "all" and msg["recipient"] != user_id:
+                        conversations.add(msg["recipient"])
+        else:
+            # Fallback to in-memory
+            for msg in db.chat_messages:
+                if msg["sender"] == user_id and msg["recipient"] and msg["recipient"] != "all":
+                    conversations.add(msg["recipient"])
+                elif msg["recipient"] == user_id and msg["sender"] != user_id:
+                    conversations.add(msg["sender"])
+        
+        # Get user details for each conversation
+        conversation_users = []
+        for user_email in conversations:
+            user_data = db.get_user_by_email(user_email)
+            if user_data:
+                tag = db.get_user_tag(user_email)
+                conversation_users.append({
+                    "user_id": user_email,
+                    "username": user_email,
+                    "role": tag["role"] if tag else "user",
+                    "color": tag["color"] if tag else "#8a2be2",
+                    "online": user_email in manager.chat_connections
+                })
+        
+        return {
+            "success": True,
+            "conversations": conversation_users
+        }
+        
+    except Exception as e:
+        logger.error(f"Get conversations error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/chat/messages", response_model=dict)
@@ -2085,3 +2119,4 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
