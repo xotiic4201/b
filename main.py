@@ -21,12 +21,6 @@ import mimetypes
 import io
 import aiohttp
 
-# In your Database class __init__ method, add:
-self.system_info = []  # Add this line
-
-# Also update your init_default_data method to include:
-db.system_info = []
-
 # ========== CONFIGURATION ==========
 logging.basicConfig(
     level=logging.INFO,
@@ -58,7 +52,7 @@ app.add_middleware(
 )
 
 # ========== ENVIRONMENT VARIABLES ==========
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY",)
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
 PORT = int(os.getenv("PORT", "8000"))
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://your-project.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your-anon-key")
@@ -290,7 +284,8 @@ class Database:
         self.chat_messages = []
         self.user_tags = {}
         self.files = {}
-        self.client_heartbeats = {}  # Track client heartbeats
+        self.client_heartbeats = {}
+        self.system_info = []
         self.init_default_data()
         self.init_user_tags()
     
@@ -415,8 +410,8 @@ class ConnectionManager:
         self.client_connections: Dict[str, WebSocket] = {}
         self.admin_connections: List[WebSocket] = []
         self.chat_connections: Dict[str, WebSocket] = {}
-        self.connection_times: Dict[str, float] = {}  # Track connection time
-        self.pending_messages: Dict[str, List[dict]] = {}  # Store messages for offline clients
+        self.connection_times: Dict[str, float] = {}
+        self.pending_messages: Dict[str, List[dict]] = {}
 
     async def connect_admin(self, websocket: WebSocket):
         await websocket.accept()
@@ -654,7 +649,7 @@ class ConnectionManager:
         timed_out = []
         
         for client_id, conn_time in self.connection_times.items():
-            if current_time - conn_time > 300:  # 5 minute timeout
+            if current_time - conn_time > 300:
                 timed_out.append(client_id)
         
         for client_id in timed_out:
@@ -1251,8 +1246,14 @@ async def upload_system_info(data: SystemInfoRequest):
                     "process_list": data.info.get("processes", []),
                     "created_at": datetime.utcnow().isoformat()
                 }).execute()
+                logger.info(f"System info stored in Supabase for client: {data.client_id}")
             except Exception as e:
                 logger.error(f"Supabase system info storage error: {e}")
+                # Fallback to in-memory
+                db.system_info.append(system_info_data)
+        else:
+            # Fallback to in-memory
+            db.system_info.append(system_info_data)
         
         return {
             "success": True,
@@ -1472,7 +1473,7 @@ async def client_heartbeat(data: dict):
         logger.error(f"Heartbeat error: {e}")
         return {"success": False, "error": str(e)}
 
-# ========== CHAT FUNCTIONS - FIXED ==========
+# ========== CHAT FUNCTIONS ==========
 @app.get("/api/chat/messages", response_model=dict)
 async def get_chat_messages(
     user: dict = Depends(authenticate_user),
@@ -1480,7 +1481,7 @@ async def get_chat_messages(
     limit: int = Query(100, ge=1, le=1000),
     before: Optional[str] = Query(None)
 ):
-    """Get chat messages with filtering - FIXED VERSION"""
+    """Get chat messages with filtering"""
     try:
         user_id = user.get("email")
         messages = []
@@ -1571,7 +1572,7 @@ async def get_chat_messages(
 
 @app.get("/api/chat/conversations", response_model=dict)
 async def get_conversations(user: dict = Depends(authenticate_user)):
-    """Get list of users you have conversations with - FIXED VERSION"""
+    """Get list of users you have conversations with"""
     try:
         user_id = user.get("email")
         conversations = set()
@@ -1619,7 +1620,7 @@ async def get_conversations(user: dict = Depends(authenticate_user)):
                     "username": user_email,
                     "role": tag["role"] if tag else "user",
                     "color": tag["color"] if tag else "#8a2be2",
-                    "online": False  # We'll update this from chat connections
+                    "online": user_email in manager.chat_connections
                 })
         
         return {
@@ -1629,51 +1630,6 @@ async def get_conversations(user: dict = Depends(authenticate_user)):
         
     except Exception as e:
         logger.error(f"Get conversations error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.post("/api/system-info", response_model=dict)
-async def upload_system_info(data: SystemInfoRequest):
-    """Upload system information - FIXED VERSION"""
-    try:
-        # Store in memory
-        system_info_data = {
-            "id": str(uuid.uuid4()),
-            "client_id": data.client_id,
-            "info": data.info,
-            "created_at": datetime.utcnow().isoformat()
-        }
-        
-        # Store in Supabase if available
-        if supabase:
-            try:
-                supabase.table("system_info").insert({
-                    "client_id": data.client_id,
-                    "cpu_info": data.info.get("cpu", {}),
-                    "memory_info": data.info.get("memory", {}),
-                    "disk_info": data.info.get("disk", {}),
-                    "network_info": data.info.get("network", {}),
-                    "process_list": data.info.get("processes", []),
-                    "created_at": datetime.utcnow().isoformat()
-                }).execute()
-                logger.info(f"System info stored in Supabase for client: {data.client_id}")
-            except Exception as e:
-                logger.error(f"Supabase system info storage error: {e}")
-                # Fallback to in-memory
-                db.system_info = db.system_info or []
-                db.system_info.append(system_info_data)
-        else:
-            # Fallback to in-memory
-            db.system_info = db.system_info or []
-            db.system_info.append(system_info_data)
-        
-        return {
-            "success": True,
-            "message": "System information uploaded",
-            "client_id": data.client_id
-        }
-        
-    except Exception as e:
-        logger.error(f"Upload system info error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/chat/users", response_model=dict)
@@ -1894,7 +1850,15 @@ async def send_chat_message(data: ChatMessage, user: dict = Depends(authenticate
             except Exception as e:
                 logger.error(f"Supabase chat message storage error: {e}")
         
-        # Send via WebSocket
+        # Send via WebSocket to all admins
+        await manager.notify_admins({
+            "type": "chat_update",
+            "message": message_data,
+            "sender_tag": sender_tag,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        # Also send to chat connections if different from admin
         if data.recipient == "all" or data.recipient is None:
             await manager.broadcast_chat({
                 "type": "new_message",
@@ -1992,6 +1956,24 @@ async def websocket_admin(websocket: WebSocket):
                 if data.get("type") == "ping":
                     await websocket.send_json({
                         "type": "pong",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                elif data.get("type") == "client_chat":
+                    # Forward client chat to specific client
+                    client_id = data.get("client_id")
+                    if client_id:
+                        await manager.send_to_client(client_id, {
+                            "type": "chat_message",
+                            "message": data.get("message"),
+                            "from_user": data.get("from_user"),
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                elif data.get("type") == "chat_update_request":
+                    # Send chat update to all admins
+                    await manager.notify_admins({
+                        "type": "chat_update",
+                        "recipient": data.get("recipient"),
+                        "sender": data.get("sender"),
                         "timestamp": datetime.utcnow().isoformat()
                     })
                     
@@ -2164,6 +2146,7 @@ async def handle_client_message(client_id: str, data: dict, websocket: WebSocket
     elif message_type == "chat_message":
         message = data.get("message", "")
         if message:
+            # Create chat message from client
             chat_msg = {
                 "id": str(uuid.uuid4()),
                 "sender": client_id,
@@ -2175,10 +2158,26 @@ async def handle_client_message(client_id: str, data: dict, websocket: WebSocket
             
             db.chat_messages.append(chat_msg)
             
+            # Notify all admins
             await manager.notify_admins({
-                "type": "client_chat",
+                "type": "client_chat_response",
                 "client_id": client_id,
                 "message": message,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            
+            # Also send to chat connections
+            await manager.broadcast_chat({
+                "type": "new_message",
+                "message": chat_msg,
+                "sender_tag": {"role": "client", "color": "#32cd32"},
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            
+            # Send acknowledgment to client
+            await websocket.send_json({
+                "type": "chat_ack",
+                "message": "Message received by server",
                 "timestamp": datetime.utcnow().isoformat()
             })
 
@@ -2303,7 +2302,7 @@ async def cleanup_tasks():
         except Exception as e:
             logger.error(f"Cleanup task error: {e}")
         
-        await asyncio.sleep(60)  # Run every minute
+        await asyncio.sleep(60)
 
 # ========== APPLICATION STARTUP ==========
 @app.on_event("startup")
@@ -2334,6 +2333,3 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
-
-
-
