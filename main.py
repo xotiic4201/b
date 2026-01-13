@@ -52,7 +52,7 @@ app.add_middleware(
 )
 
 # ========== ENVIRONMENT VARIABLES ==========
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", secrets.token_urlsafe(32))
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY",
 PORT = int(os.getenv("PORT", "8000"))
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://your-project.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your-anon-key")
@@ -2260,3 +2260,4 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
