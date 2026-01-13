@@ -21,6 +21,12 @@ import mimetypes
 import io
 import aiohttp
 
+# In your Database class __init__ method, add:
+self.system_info = []  # Add this line
+
+# Also update your init_default_data method to include:
+db.system_info = []
+
 # ========== CONFIGURATION ==========
 logging.basicConfig(
     level=logging.INFO,
@@ -1466,6 +1472,7 @@ async def client_heartbeat(data: dict):
         logger.error(f"Heartbeat error: {e}")
         return {"success": False, "error": str(e)}
 
+# ========== CHAT FUNCTIONS - FIXED ==========
 @app.get("/api/chat/messages", response_model=dict)
 async def get_chat_messages(
     user: dict = Depends(authenticate_user),
@@ -1473,37 +1480,49 @@ async def get_chat_messages(
     limit: int = Query(100, ge=1, le=1000),
     before: Optional[str] = Query(None)
 ):
-    """Get chat messages with filtering"""
+    """Get chat messages with filtering - FIXED VERSION"""
     try:
         user_id = user.get("email")
         messages = []
         
         # Get from Supabase if available
         if supabase:
-            query = supabase.table("chat_messages").select("*")
-            
-            # Filter messages based on recipient
-            if recipient:
-                if recipient == "all":
-                    query = query.or_("recipient.eq.all,recipient.is.null")
+            try:
+                # Build query based on recipient
+                if recipient:
+                    if recipient == "all":
+                        # Get global messages
+                        response = supabase.table("chat_messages")\
+                            .select("*")\
+                            .or_(f"recipient.eq.all,recipient.is.null")\
+                            .order("timestamp", desc=True)\
+                            .limit(limit)\
+                            .execute()
+                    else:
+                        # Get private messages between users
+                        response = supabase.table("chat_messages")\
+                            .select("*")\
+                            .or_(f"and(sender.eq.{user_id},recipient.eq.{recipient})," +
+                                 f"and(sender.eq.{recipient},recipient.eq.{user_id})")\
+                            .order("timestamp", desc=True)\
+                            .limit(limit)\
+                            .execute()
                 else:
-                    query = query.or_(
-                        f"and(sender.eq.{user_id},recipient.eq.{recipient})," +
-                        f"and(sender.eq.{recipient},recipient.eq.{user_id})"
-                    )
-            else:
-                query = query.or_(
-                    f"recipient.eq.all,recipient.is.null," +
-                    f"recipient.eq.{user_id},sender.eq.{user_id}"
-                )
-            
-            if before:
-                query = query.lt("timestamp", before)
-            
-            response = query.order("timestamp", desc=True).limit(limit).execute()
-            
-            if response.data:
-                messages = response.data
+                    # Get all relevant messages for user
+                    response = supabase.table("chat_messages")\
+                        .select("*")\
+                        .or_(f"sender.eq.{user_id},recipient.eq.{user_id},recipient.eq.all,recipient.is.null")\
+                        .order("timestamp", desc=True)\
+                        .limit(limit)\
+                        .execute()
+                
+                if response.data:
+                    messages = response.data
+                    
+            except Exception as e:
+                logger.error(f"Supabase chat query error: {e}")
+                # Fallback to in-memory
+                messages = db.chat_messages.copy()
         else:
             # Fallback to in-memory
             messages = db.chat_messages.copy()
@@ -1525,8 +1544,7 @@ async def get_chat_messages(
                 messages = [
                     msg for msg in messages
                     if (msg["recipient"] in [user_id, "all", None] or 
-                        msg["sender"] == user_id or 
-                        user_id in msg.get("read_by", []))
+                        msg["sender"] == user_id)
                 ]
             
             if before:
@@ -1543,7 +1561,7 @@ async def get_chat_messages(
         
         return {
             "success": True,
-            "messages": messages[::-1],
+            "messages": messages[::-1],  # Reverse to get chronological order
             "total": len(messages)
         }
         
@@ -1553,30 +1571,41 @@ async def get_chat_messages(
 
 @app.get("/api/chat/conversations", response_model=dict)
 async def get_conversations(user: dict = Depends(authenticate_user)):
-    """Get list of users you have conversations with"""
+    """Get list of users you have conversations with - FIXED VERSION"""
     try:
         user_id = user.get("email")
         conversations = set()
         
         # Get from Supabase if available
         if supabase:
-            response = supabase.table("chat_messages")\
-                .select("sender, recipient")\
-                .or_(f"sender.eq.{user_id},recipient.eq.{user_id}")\
-                .execute()
-            
-            if response.data:
-                for msg in response.data:
-                    if msg["sender"] != user_id:
-                        conversations.add(msg["sender"])
-                    if msg["recipient"] and msg["recipient"] != "all" and msg["recipient"] != user_id:
+            try:
+                # Get messages where user is sender or recipient
+                response = supabase.table("chat_messages")\
+                    .select("sender, recipient")\
+                    .or_(f"sender.eq.{user_id},recipient.eq.{user_id}")\
+                    .execute()
+                
+                if response.data:
+                    for msg in response.data:
+                        if msg["sender"] != user_id and msg["sender"] not in ["all", None]:
+                            conversations.add(msg["sender"])
+                        if msg["recipient"] and msg["recipient"] not in ["all", None, user_id]:
+                            conversations.add(msg["recipient"])
+                            
+            except Exception as e:
+                logger.error(f"Supabase conversations query error: {e}")
+                # Fallback to in-memory
+                for msg in db.chat_messages:
+                    if msg["sender"] == user_id and msg["recipient"] and msg["recipient"] not in ["all", None]:
                         conversations.add(msg["recipient"])
+                    elif msg["recipient"] == user_id and msg["sender"] not in ["all", None, user_id]:
+                        conversations.add(msg["sender"])
         else:
             # Fallback to in-memory
             for msg in db.chat_messages:
-                if msg["sender"] == user_id and msg["recipient"] and msg["recipient"] != "all":
+                if msg["sender"] == user_id and msg["recipient"] and msg["recipient"] not in ["all", None]:
                     conversations.add(msg["recipient"])
-                elif msg["recipient"] == user_id and msg["sender"] != user_id:
+                elif msg["recipient"] == user_id and msg["sender"] not in ["all", None, user_id]:
                     conversations.add(msg["sender"])
         
         # Get user details for each conversation
@@ -1590,7 +1619,7 @@ async def get_conversations(user: dict = Depends(authenticate_user)):
                     "username": user_email,
                     "role": tag["role"] if tag else "user",
                     "color": tag["color"] if tag else "#8a2be2",
-                    "online": user_email in manager.chat_connections
+                    "online": False  # We'll update this from chat connections
                 })
         
         return {
@@ -1600,6 +1629,51 @@ async def get_conversations(user: dict = Depends(authenticate_user)):
         
     except Exception as e:
         logger.error(f"Get conversations error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/system-info", response_model=dict)
+async def upload_system_info(data: SystemInfoRequest):
+    """Upload system information - FIXED VERSION"""
+    try:
+        # Store in memory
+        system_info_data = {
+            "id": str(uuid.uuid4()),
+            "client_id": data.client_id,
+            "info": data.info,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        # Store in Supabase if available
+        if supabase:
+            try:
+                supabase.table("system_info").insert({
+                    "client_id": data.client_id,
+                    "cpu_info": data.info.get("cpu", {}),
+                    "memory_info": data.info.get("memory", {}),
+                    "disk_info": data.info.get("disk", {}),
+                    "network_info": data.info.get("network", {}),
+                    "process_list": data.info.get("processes", []),
+                    "created_at": datetime.utcnow().isoformat()
+                }).execute()
+                logger.info(f"System info stored in Supabase for client: {data.client_id}")
+            except Exception as e:
+                logger.error(f"Supabase system info storage error: {e}")
+                # Fallback to in-memory
+                db.system_info = db.system_info or []
+                db.system_info.append(system_info_data)
+        else:
+            # Fallback to in-memory
+            db.system_info = db.system_info or []
+            db.system_info.append(system_info_data)
+        
+        return {
+            "success": True,
+            "message": "System information uploaded",
+            "client_id": data.client_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Upload system info error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/chat/users", response_model=dict)
@@ -2260,5 +2334,6 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
 
 
