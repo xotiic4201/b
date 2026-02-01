@@ -1,4 +1,6 @@
-# backend_unified.py - Complete ANALCONTROL v4.0 with J.A.R.V.I.S. AI (FREE Local AI - NO API KEYS)
+# backend_full.py - Complete ANALCONTROL Backend v4.0 with J.A.R.V.I.S. AI
+# Full-featured production-ready backend with all monitoring capabilities
+
 import os
 import sys
 import logging
@@ -8,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, validator
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Union
 from datetime import datetime, timedelta
 import secrets
 import jwt
@@ -24,27 +26,82 @@ import random
 import traceback
 import html
 import re
-from supabase import create_client, Client
+from collections import defaultdict
+from pathlib import Path
+import tempfile
+import shutil
 
 # ========== CONFIGURATION ==========
+PORT = int(os.getenv("PORT", 5000))
+JWT_SECRET_KEY = os.getenv("JWT_SECRET", secrets.token_hex(32))
+BACKEND_URL = os.getenv("BACKEND_URL", f"http://localhost:{PORT}")
+UPLOAD_DIR = Path("uploads")
+SCREENSHOTS_DIR = UPLOAD_DIR / "screenshots"
+RECORDINGS_DIR = UPLOAD_DIR / "recordings"
+PYTHON_SCRIPTS_DIR = UPLOAD_DIR / "python_scripts"
+
+# Create directories
+for directory in [UPLOAD_DIR, SCREENSHOTS_DIR, RECORDINGS_DIR, PYTHON_SCRIPTS_DIR]:
+    directory.mkdir(parents=True, exist_ok=True)
+
+# ========== LOGGING ==========
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('analcontrol_backend.log')
+        logging.FileHandler('analcontrol.log')
     ]
 )
 logger = logging.getLogger(__name__)
 
-# ========== CREATE FASTAPI APP ==========
+class StructuredLogger:
+    """Structured logging for better analytics"""
+    
+    def __init__(self):
+        self.logs = []
+        self.max_logs = 10000
+    
+    def log(self, level: str, message: str, data: Dict = None):
+        """Add structured log entry"""
+        entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": level,
+            "message": message,
+            "data": data or {}
+        }
+        self.logs.append(entry)
+        if len(self.logs) > self.max_logs:
+            self.logs = self.logs[-self.max_logs:]
+        
+        # Also log to standard logger
+        getattr(logger, level.lower())(f"{message} {data if data else ''}")
+    
+    def get_logs(self, limit: int = 100, level: str = None):
+        """Get recent logs"""
+        logs = self.logs[-limit:]
+        if level:
+            logs = [log for log in logs if log['level'] == level]
+        return logs
+    
+    def log_api_call(self, endpoint: str, user: str, status: str, data: Dict = None):
+        """Log API call"""
+        self.log("INFO", f"API Call: {endpoint}", {
+            "endpoint": endpoint,
+            "user": user,
+            "status": status,
+            "data": data
+        })
+
+structured_logger = StructuredLogger()
+
+# ========== FASTAPI APP ==========
 app = FastAPI(
-    title="ANALCONTROL API with J.A.R.V.I.S.",
-    version="4.0",
-    description="Advanced Client Monitoring System with FREE Local AI Assistant",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json"
+    title="ANALCONTROL API",
+    description="Advanced Client Monitoring System with J.A.R.V.I.S. AI Assistant",
+    version="4.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc"
 )
 
 # CORS Configuration
@@ -56,400 +113,636 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ========== ENVIRONMENT VARIABLES ==========
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
-PORT = int(os.getenv("PORT", "8000"))
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://your-project.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your-anon-key")
-BACKEND_URL = os.getenv("BACKEND_URL", "https://dd-kpxl.onrender.com")
-
-# ========== SUPABASE CLIENT ==========
-try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("✅ Supabase client initialized")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize Supabase: {e}")
-    supabase = None
-
 # Security
 security = HTTPBearer()
 
-# ========== LOCAL AI MODELS (NO API KEYS NEEDED) ==========
+# ========== IN-MEMORY DATABASES ==========
+class Database:
+    """Simple in-memory database for demo purposes"""
+    
+    def __init__(self):
+        self.users = {
+            "admin": {
+                "id": "1",
+                "email": "admin",
+                "password": "admin123",  # In production, use hashed passwords
+                "is_admin": True,
+                "theme": "red_black",
+                "created_at": datetime.utcnow().isoformat()
+            }
+        }
+        self.clients = {}
+        self.commands = []
+        self.screenshots = []
+        self.recordings = []
+        self.logs = []
+        self.chat_messages = []
+        self.python_executions = []
+        self.websocket_connections = {}
+        self.client_websockets = {}
+        
+    def add_client(self, client_data: Dict):
+        """Add or update client"""
+        client_id = client_data['client_id']
+        if client_id not in self.clients:
+            client_data['created_at'] = datetime.utcnow().isoformat()
+        client_data['last_seen'] = datetime.utcnow().isoformat()
+        client_data['ws_online'] = False
+        self.clients[client_id] = client_data
+        return client_data
+    
+    def get_client(self, client_id: str):
+        """Get client by ID"""
+        return self.clients.get(client_id)
+    
+    def get_all_clients(self):
+        """Get all clients"""
+        return list(self.clients.values())
+    
+    def add_command(self, command_data: Dict):
+        """Add command to history"""
+        command_data['id'] = str(uuid.uuid4())
+        command_data['created_at'] = datetime.utcnow().isoformat()
+        command_data['status'] = 'pending'
+        self.commands.append(command_data)
+        return command_data
+    
+    def update_command(self, command_id: str, updates: Dict):
+        """Update command status"""
+        for cmd in self.commands:
+            if cmd['id'] == command_id:
+                cmd.update(updates)
+                cmd['updated_at'] = datetime.utcnow().isoformat()
+                return cmd
+        return None
+    
+    def add_screenshot(self, screenshot_data: Dict):
+        """Add screenshot"""
+        screenshot_data['id'] = str(uuid.uuid4())
+        screenshot_data['created_at'] = datetime.utcnow().isoformat()
+        self.screenshots.append(screenshot_data)
+        return screenshot_data
+    
+    def add_recording(self, recording_data: Dict):
+        """Add recording"""
+        recording_data['id'] = str(uuid.uuid4())
+        recording_data['created_at'] = datetime.utcnow().isoformat()
+        self.recordings.append(recording_data)
+        return recording_data
+    
+    def add_log(self, log_data: Dict):
+        """Add system log"""
+        log_data['id'] = str(uuid.uuid4())
+        log_data['created_at'] = datetime.utcnow().isoformat()
+        self.logs.append(log_data)
+        if len(self.logs) > 10000:
+            self.logs = self.logs[-10000:]
+        return log_data
+    
+    def add_chat_message(self, message_data: Dict):
+        """Add chat message"""
+        message_data['id'] = str(uuid.uuid4())
+        message_data['timestamp'] = datetime.utcnow().isoformat()
+        self.chat_messages.append(message_data)
+        return message_data
+    
+    def get_stats(self):
+        """Get system statistics"""
+        now = datetime.utcnow()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        online_clients = sum(1 for c in self.clients.values() if c.get('ws_online'))
+        
+        today_screenshots = sum(1 for s in self.screenshots 
+                               if datetime.fromisoformat(s['created_at']) >= today_start)
+        
+        today_logs = sum(1 for l in self.logs 
+                        if datetime.fromisoformat(l['created_at']) >= today_start)
+        
+        return {
+            "total_clients": len(self.clients),
+            "online_clients": online_clients,
+            "ws_online_clients": online_clients,
+            "total_commands": len(self.commands),
+            "total_screenshots": len(self.screenshots),
+            "today_screenshots": today_screenshots,
+            "total_recordings": len(self.recordings),
+            "total_logs": len(self.logs),
+            "today_logs": today_logs,
+            "chat_users": len(self.websocket_connections)
+        }
+
+db = Database()
+
+# ========== LOCAL AI IMPLEMENTATION ==========
 class LocalAI:
-    """Local AI that runs entirely on your server - NO API KEYS NEEDED"""
+    """Advanced Local AI with pattern matching and context awareness"""
     
     def __init__(self):
         self.patterns = self._load_patterns()
-        self.model_loaded = False
+        self.conversation_context = {}
         self.similarity_threshold = 0.3
         
     def _load_patterns(self):
-        """Load extensive pattern matching for ANALCONTROL"""
+        """Load comprehensive AI response patterns"""
         return {
-            # Greetings
+            # Greetings & Basic Interaction
             "hello": "Good evening, sir. J.A.R.V.I.S. systems are online. How may I assist with ANALCONTROL operations today?",
             "hi": "Good evening. J.A.R.V.I.S. at your service. How can I help with the monitoring system?",
-            "hey": "Greetings. How may I assist you with ANALCONTROL today?",
-            "greetings": "Good day, sir. J.A.R.V.I.S. is ready to assist.",
+            "hey": "Greetings, sir. How may I assist you with ANALCONTROL today?",
+            "good morning": "Good morning, sir. J.A.R.V.I.S. systems are ready for today's operations.",
+            "good afternoon": "Good afternoon, sir. All systems are running optimally.",
+            "good evening": "Good evening, sir. How may I assist you this evening?",
             
-            # Help and capabilities
-            "help": """I can help you with ANALCONTROL v4.0:
+            # Help & Capabilities
+            "help": """I can assist you with ANALCONTROL v4.0:
 
 📊 **Website Navigation:**
-   • Switch between all 7 tabs
-   • Refresh any section
-   • Search and filter data
+   • Switch between all 7 tabs (Clients, Commands, Python, Screenshots, Recordings, Logs, Chat)
+   • Refresh any section dynamically
+   • Search and filter data across all modules
 
 🖥️ **Client Operations:**
-   • Monitor client status
-   • Execute commands remotely
-   • Capture screenshots
-   • Record screens
-   • Live stream displays
+   • Monitor real-time client status
+   • Execute remote commands
+   • Capture screenshots and screen recordings
+   • Live stream client displays
+   • Get comprehensive system information
 
 💻 **System Management:**
-   • View system logs
-   • Check performance metrics
-   • Manage recordings
-   • Handle Python scripts
+   • View detailed system logs with filtering
+   • Check performance metrics and analytics
+   • Manage recording library
+   • Handle Python script execution
 
 💬 **Communication:**
-   • Chat with users
-   • Message clients
-   • Global messaging
+   • Global chat with all users
+   • Private messaging capabilities
+   • Client communication interface
+   • Real-time notifications
 
-⚡ **Quick Actions:**
-   • "Show clients" - View connected systems
-   • "Take screenshot" - Capture screen
-   • "Open Python" - Access Python tab
-   • "Refresh all" - Update all data
+⚡ **Quick Commands:**
+   • "Show clients" - View all connected systems
+   • "Take screenshot" - Capture screen from clients
+   • "Open Python" - Access Python execution panel
+   • "Refresh all" - Update all dashboard data
+   • "System status" - Get comprehensive status report
 
-What would you like to do?""",
-            
-            "what can you do": """I have complete control over ANALCONTROL v4.0:
+What specific task would you like assistance with?""",
 
-🔧 **Full Website Control:**
-   • Navigate all tabs and panels
-   • Click any button or control
-   • Fill forms and submit them
-   • Refresh data dynamically
+            "what can you do": """I have comprehensive control over ANALCONTROL v4.0:
 
-🎯 **Client Management:**
-   • View all connected clients
-   • Execute commands on any client
-   • Capture screenshots/recordings
-   • Get system information
-   • Start/stop live streams
+🔧 **Full System Control:**
+   • Complete website navigation and control
+   • Execute any button click or form submission
+   • Dynamic data refresh across all panels
+   • Real-time WebSocket communication
 
-📁 **File Operations:**
-   • Execute Python scripts
-   • Manage screenshot gallery
+🎯 **Advanced Client Management:**
+   • View all connected clients with live status
+   • Execute custom commands remotely
+   • Capture screenshots with quality options
+   • Record screens with configurable settings
+   • Get detailed system information
+   • Start/stop live streaming sessions
+
+📁 **File & Script Operations:**
+   • Execute Python scripts on remote clients
+   • Manage screenshot gallery with filters
    • Handle recording library
-   • View and export logs
+   • View and export system logs
+   • Template management for scripts
 
-💬 **Communication:**
+💬 **Communication Hub:**
    • Global chat interface
-   • Private messaging
+   • Private user messaging
    • Client communication
-   • User notifications
+   • Notification system
+   • Typing indicators
 
-📊 **Monitoring:**
-   • Real-time status updates
-   • Connection graphs
-   • System statistics
-   • Performance metrics
+📊 **Monitoring & Analytics:**
+   • Real-time status updates via WebSocket
+   • Connection graphs and charts
+   • Comprehensive system statistics
+   • Performance metrics tracking
+   • Activity logging
 
-Try commands like:
-• "Show me connected clients"
-• "Take screenshot of client-001"
+🚀 **Automation:**
+   • Scheduled tasks
+   • Auto-capture screenshots
+   • Bulk operations on clients
+   • Command queuing
+
+Try asking me to:
+• "Show connected clients"
+• "Take screenshot from all clients"
 • "Open command panel"
-• "Check system status"
-• "Message all users" """,
+• "Check system health"
+• "Start live stream"
+• "Execute Python script"
+
+I'm here to make ANALCONTROL operations seamless for you, sir.""",
+
+            # Navigation Commands
+            "show client": "Opening Clients tab to display all connected systems. [Action: switch to clients]",
+            "open client": "Switching to Clients tab now, sir. [Action: switch to clients]",
+            "view client": "Displaying client dashboard with live status. [Action: switch to clients]",
+            "list client": "Showing all clients in the monitoring system. [Action: switch to clients]",
+            "connected client": "Displaying currently connected clients. [Action: switch to clients]",
+            "online client": "Showing online client systems. [Action: switch to clients]",
             
-            "what is analcontrol": """ANALCONTROL v4.0 is an advanced client monitoring and control system.
+            "show command": "Opening Commands tab for remote execution control. [Action: switch to commands]",
+            "open command": "Accessing command control panel now. [Action: switch to commands]",
+            "command panel": "Loading command execution interface. [Action: switch to commands]",
+            "execute command": "Opening command execution panel. [Action: switch to commands]",
+            
+            "show python": "Opening Python script execution tab. [Action: switch to python]",
+            "open python": "Accessing Python script editor and execution panel. [Action: switch to python]",
+            "python tab": "Loading Python script management interface. [Action: switch to python]",
+            "run python": "Opening Python execution environment. [Action: switch to python]",
+            "python script": "Accessing script management system. [Action: switch to python]",
+            
+            "show screenshot": "Opening Screenshots gallery and capture controls. [Action: switch to screenshots]",
+            "open screenshot": "Accessing screenshot management panel. [Action: switch to screenshots]",
+            "view screenshot": "Loading screenshot library with filters. [Action: switch to screenshots]",
+            "screenshot gallery": "Displaying screenshot gallery. [Action: switch to screenshots]",
+            
+            "show recording": "Opening screen recordings library. [Action: switch to recordings]",
+            "open recording": "Accessing recording management panel. [Action: switch to recordings]",
+            "view recording": "Loading video recordings library. [Action: switch to recordings]",
+            "recording library": "Displaying recording archive. [Action: switch to recordings]",
+            
+            "show log": "Opening system logs with advanced filtering. [Action: switch to logs]",
+            "open log": "Accessing comprehensive system logs. [Action: switch to logs]",
+            "view log": "Displaying activity logs and system events. [Action: switch to logs]",
+            "system log": "Loading log management interface. [Action: switch to logs]",
+            
+            "show chat": "Opening communication and chat interface. [Action: switch to chat]",
+            "open chat": "Accessing messaging system. [Action: switch to chat]",
+            "chat panel": "Loading chat and communication panel. [Action: switch to chat]",
+            "message": "Opening messaging interface. [Action: switch to chat]",
+            
+            # Action Commands
+            "take screenshot": "Initiating screenshot capture from connected clients. [Action: execute screenshot]",
+            "capture screenshot": "Beginning screenshot capture process. [Action: execute screenshot]",
+            "grab screen": "Taking screen capture from clients. [Action: execute screenshot]",
+            "screenshot all": "Capturing screenshots from all online clients. [Action: execute screenshot all]",
+            "capture all": "Initiating bulk screenshot capture. [Action: execute screenshot all]",
+            
+            "start recording": "Beginning screen recording session. [Action: execute record_screen]",
+            "record screen": "Initiating screen recording with configured settings. [Action: execute record_screen]",
+            "start video": "Starting video capture from clients. [Action: execute record_screen]",
+            "record all": "Beginning screen recording on all clients. [Action: execute record_screen all]",
+            
+            "live stream": "Starting live screen streaming session. [Action: execute live_screen]",
+            "stream screen": "Initiating real-time screen stream. [Action: execute live_screen]",
+            "watch live": "Opening live screen viewing interface. [Action: execute live_screen]",
+            "start stream": "Beginning live screen streaming. [Action: execute live_screen]",
+            
+            "refresh": "Refreshing all system data and status information. [Action: refresh all]",
+            "update": "Updating dashboard with latest information. [Action: refresh all]",
+            "reload": "Reloading all system components and data. [Action: refresh all]",
+            "sync": "Synchronizing all panels and data sources. [Action: refresh all]",
+            
+            "system info": "Retrieving comprehensive system information from clients. [Action: execute system_info]",
+            "get info": "Fetching detailed client system information. [Action: execute system_info]",
+            "client info": "Getting client system details and specifications. [Action: execute system_info]",
+            "check system": "Checking client system information. [Action: execute system_info]",
+            
+            # Status & Health Queries
+            "status": "Analyzing ANALCONTROL system status and health metrics. [Action: check status]",
+            "system status": "Checking comprehensive system health and performance. [Action: check status]",
+            "health": "Evaluating system health and component status. [Action: check status]",
+            "system health": "Performing health check on all components. [Action: check status]",
+            "check status": "Running system status diagnostics. [Action: check status]",
+            "how many client": "Counting and analyzing connected clients. [Action: refresh clients]",
+            "client count": "Checking total client count and status. [Action: refresh clients]",
+            "online count": "Determining number of online clients. [Action: refresh clients]",
+            
+            # Information & Documentation
+            "what is analcontrol": """ANALCONTROL v4.0 is a comprehensive advanced client monitoring and remote administration system.
 
 🎯 **Core Purpose:**
-   • Real-time remote system monitoring
-   • Centralized client management
-   • Automated system administration
-   • Comprehensive logging and analytics
+   • Real-time remote system monitoring and management
+   • Centralized client administration dashboard
+   • Automated system maintenance and diagnostics
+   • Comprehensive logging and analytics platform
 
 🛠️ **Key Features:**
-   • **Client Dashboard**: Live status monitoring
-   • **Command Center**: Remote command execution
-   • **Python Engine**: Script execution on clients
-   • **Screen Capture**: Screenshots & recordings
+   • **Client Dashboard**: Live status monitoring with WebSocket updates
+   • **Command Center**: Remote command execution with history
+   • **Python Engine**: Script execution on remote clients
+   • **Screen Capture**: Screenshot and video recording capabilities
    • **Live Streaming**: Real-time screen viewing
-   • **Chat System**: User/client communication
-   • **Log Management**: System activity tracking
+   • **Chat System**: User and client communication
+   • **Log Management**: Comprehensive activity tracking
    • **User Roles**: Role-based access control
+   • **AI Assistant**: J.A.R.V.I.S. integration for voice control
 
 🚀 **Use Cases:**
-   • IT administration and monitoring
-   • Remote system management
-   • Security surveillance
-   • Automated maintenance
+   • IT system administration and monitoring
+   • Remote technical support operations
+   • Security surveillance and monitoring
+   • Automated system maintenance
    • User activity monitoring
-   • System diagnostics
+   • Network diagnostics and troubleshooting
+   • Compliance and audit logging
 
 ⚡ **Real-time Capabilities:**
-   • WebSocket connections
-   • Live status updates
-   • Instant command results
-   • Real-time chat
+   • WebSocket-based instant updates
+   • Live status monitoring
+   • Instant command execution
+   • Real-time chat messaging
    • Live screen streaming
 
-I'm J.A.R.V.I.S., your AI assistant for this powerful platform.""",
+🔒 **Security Features:**
+   • JWT-based authentication
+   • Role-based access control
+   • Encrypted communications
+   • Activity logging and audit trails
+
+I'm J.A.R.V.I.S., your AI assistant designed to make this powerful platform easy to use and highly efficient.""",
+
+            "about": """ANALCONTROL v4.0 - Advanced Monitoring & Control System
+
+**Architecture:**
+• Modern web-based interface
+• Real-time WebSocket communications
+• RESTful API backend
+• Scalable microservices design
+
+**Technology Stack:**
+• Frontend: HTML5, CSS3, Vanilla JavaScript
+• Backend: Python FastAPI
+• Real-time: WebSocket protocol
+• AI: J.A.R.V.I.S. local pattern matching
+
+**Capabilities:**
+• Unlimited client connections
+• Real-time monitoring and control
+• Screenshot and video capture
+• Remote script execution
+• Comprehensive logging
+• Multi-user support
+
+Designed and optimized for enterprise-grade monitoring operations.""",
+
+            "version": "ANALCONTROL Version 4.0 with J.A.R.V.I.S. AI Integration. Latest production build with full website control capabilities and advanced monitoring features.",
             
-            # Navigation patterns
-            "show client": "Opening Clients tab to display connected systems. [Action: switch to clients]",
-            "open client": "Switching to Clients tab. [Action: switch to clients]",
-            "view client": "Displaying client dashboard. [Action: switch to clients]",
-            "connected client": "Showing connected clients. [Action: switch to clients]",
-            "online client": "Displaying online systems. [Action: switch to clients]",
-            
-            "show command": "Opening Commands tab for remote execution. [Action: switch to commands]",
-            "open command": "Accessing command control panel. [Action: switch to commands]",
-            "execute command": "Loading command interface. [Action: switch to commands]",
-            "send command": "Preparing command execution. [Action: switch to commands]",
-            
-            "show python": "Opening Python tab for script execution. [Action: switch to python]",
-            "open python": "Accessing Python script editor. [Action: switch to python]",
-            "run python": "Loading Python execution panel. [Action: switch to python]",
-            "python script": "Opening script management. [Action: switch to python]",
-            
-            "show screenshot": "Opening Screenshots tab. [Action: switch to screenshots]",
-            "open screenshot": "Accessing screenshot gallery. [Action: switch to screenshots]",
-            "view screenshot": "Loading screenshot library. [Action: switch to screenshots]",
-            "capture screenshot": "Opening capture controls. [Action: switch to screenshots]",
-            
-            "show recording": "Opening Recordings tab. [Action: switch to recordings]",
-            "open recording": "Accessing recording library. [Action: switch to recordings]",
-            "view recording": "Loading video recordings. [Action: switch to recordings]",
-            "record screen": "Opening recording controls. [Action: switch to recordings]",
-            
-            "show log": "Opening Logs tab. [Action: switch to logs]",
-            "open log": "Accessing system logs. [Action: switch to logs]",
-            "view log": "Displaying activity logs. [Action: switch to logs]",
-            "check log": "Loading log history. [Action: switch to logs]",
-            
-            "show chat": "Opening Chat tab. [Action: switch to chat]",
-            "open chat": "Accessing chat interface. [Action: switch to chat]",
-            "message": "Loading messaging system. [Action: switch to chat]",
-            "talk to": "Opening communication panel. [Action: switch to chat]",
-            
-            # Action patterns
-            "take screenshot": "Capturing screenshot from connected clients. [Action: execute screenshot]",
-            "capture screenshot": "Initiating screenshot capture. [Action: execute screenshot]",
-            "grab screen": "Taking screen capture. [Action: execute screenshot]",
-            "screenshot all": "Capturing all client screens. [Action: execute screenshot all]",
-            
-            "start recording": "Beginning screen recording. [Action: execute record_screen]",
-            "record screen": "Initiating screen recording. [Action: execute record_screen]",
-            "start video": "Starting video capture. [Action: execute record_screen]",
-            "record all": "Recording all client screens. [Action: execute record_screen all]",
-            
-            "live stream": "Starting live screen streaming. [Action: execute live_screen]",
-            "stream screen": "Initiating live stream. [Action: execute live_screen]",
-            "watch live": "Opening live view. [Action: execute live_screen]",
-            "live view": "Starting live streaming. [Action: execute live_screen]",
-            
-            "refresh": "Refreshing all system data. [Action: refresh all]",
-            "update": "Updating dashboard information. [Action: refresh all]",
-            "reload": "Reloading system data. [Action: refresh all]",
-            "sync": "Synchronizing all panels. [Action: refresh all]",
-            
-            "system info": "Getting system information from clients. [Action: execute system_info]",
-            "get info": "Retrieving client system details. [Action: execute system_info]",
-            "check system": "Checking client systems. [Action: execute system_info]",
-            "client info": "Getting client information. [Action: execute system_info]",
-            
-            # Status queries
-            "status": "Checking system status and metrics. [Action: check status]",
-            "system status": "Analyzing ANALCONTROL system health. [Action: check status]",
-            "health": "Checking system health status. [Action: check status]",
-            "how many client": "Counting connected clients. [Action: refresh clients]",
-            "online count": "Checking online client count. [Action: refresh clients]",
+            "features": """ANALCONTROL v4.0 Feature Overview:
+
+✨ **Core Features:**
+• Real-time client monitoring
+• Remote command execution
+• Screenshot capture
+• Screen recording
+• Live streaming
+• Python script execution
+• Chat system
+• Comprehensive logging
+
+🤖 **AI Features:**
+• J.A.R.V.I.S. voice assistant
+• Natural language commands
+• Automated responses
+• Context awareness
+• Text-to-speech output
+
+📊 **Analytics:**
+• Real-time dashboards
+• Historical data tracking
+• Performance metrics
+• Usage statistics
+• Activity reports
+
+Would you like details on any specific feature?""",
             
             # Troubleshooting
-            "not working": "I understand you're experiencing issues, sir. Let me help troubleshoot. What specifically isn't working? You can describe the problem and I'll guide you through solutions.",
-            "error": "I apologize for the error. Could you provide more details about what happened? This will help me assist you better with the issue.",
-            "broken": "Let me help you resolve this. What component seems to be malfunctioning? I can guide you through recovery steps.",
-            "fix": "I'll help you fix the issue. Please describe what needs repair or what error you're encountering.",
+            "not working": "I understand you're experiencing issues, sir. Let me help troubleshoot. Could you specify what component or feature isn't functioning as expected? I can guide you through diagnostics and resolution.",
             
-            # Information
-            "version": "ANALCONTROL Version 4.0 with J.A.R.V.I.S. AI Integration. Latest build with full website control capabilities.",
-            "who made": "ANALCONTROL was developed for comprehensive system monitoring and administration. I'm J.A.R.V.I.S., your integrated AI assistant.",
-            "developer": "This platform is designed for advanced client monitoring, remote management, and system administration.",
-            "about": """ANALCONTROL v4.0 - Advanced Monitoring System
-
-• **Purpose**: Comprehensive remote system management
-• **Features**: Real-time monitoring, command execution, media capture
-• **AI Integration**: J.A.R.V.I.S. assistant with full website control
-• **Architecture**: Modern web-based, real-time updates
-• **Security**: Role-based access, encrypted communications
-• **Scalability**: Supports unlimited client connections
-
-I'm here to help you leverage all these capabilities effectively.""",
+            "error": "I apologize for the error, sir. To assist you effectively, please provide details about: 1) What action were you attempting? 2) What error message appeared? 3) Which section of ANALCONTROL were you using? This will help me provide precise guidance.",
             
-            # Gratitude
-            "thank": "You're welcome, sir. Always happy to assist with ANALCONTROL operations.",
-            "thanks": "My pleasure. Let me know if you need further assistance.",
-            "appreciate": "Thank you, sir. I'm here to ensure system efficiency.",
+            "broken": "Let me help resolve this issue, sir. Which component appears to be malfunctioning? Is it related to client connections, commands, screenshots, or another feature? I can guide you through recovery steps.",
             
-            # Farewell
-            "bye": "Goodbye, sir. J.A.R.V.I.S. systems will remain online for your next command.",
-            "goodbye": "Farewell. The monitoring systems continue running.",
-            "exit": "Exiting chat interface. Type anything to reactivate J.A.R.V.I.S.",
-            "close": "Closing chat window. I remain active in the background.",
+            "fix": "I'll assist with resolving this issue. Please describe what needs repair or what error you're encountering. The more details you provide, the better I can help fix the problem.",
             
-            # Confirmation
-            "yes": "Affirmative. Proceeding as requested.",
-            "no": "Understood. Operation cancelled.",
-            "ok": "Acknowledged. Continuing with current operations.",
-            "okay": "Confirmed. Standing by for next instruction.",
+            "problem": "I'm here to help solve any problems, sir. What specific issue are you encountering with ANALCONTROL? Whether it's connectivity, functionality, or performance-related, I can provide guidance.",
             
-            # Default fallback
-            "default": "I understand you're asking about ANALCONTROL. I can help with website navigation, client management, command execution, system monitoring, and communication features. Could you be more specific about what you'd like to do?"
+            # Gratitude & Acknowledgment
+            "thank": "You're most welcome, sir. I'm always here to assist with ANALCONTROL operations. Don't hesitate to ask if you need anything else.",
+            
+            "thanks": "My pleasure, sir. Happy to help ensure smooth system operations. Let me know if there's anything more I can do.",
+            
+            "thank you": "You're very welcome, sir. It's my function to ensure ANALCONTROL runs optimally. Feel free to ask for assistance anytime.",
+            
+            "appreciate": "Thank you, sir. I'm here to ensure maximum system efficiency and your satisfaction. Please don't hesitate to request further assistance.",
+            
+            "good job": "Thank you for the feedback, sir. I'm programmed to provide optimal assistance. How else may I help you today?",
+            
+            # Farewells
+            "bye": "Goodbye, sir. J.A.R.V.I.S. systems will remain online and monitoring. I'll be ready when you need me again.",
+            
+            "goodbye": "Farewell, sir. All monitoring systems continue running. I'm always available when you need assistance.",
+            
+            "see you": "Until next time, sir. ANALCONTROL systems remain active and I'm standing by for your next command.",
+            
+            "exit": "Exiting chat interface, sir. I remain active in the background, monitoring all systems. Simply call upon me when needed.",
+            
+            "close": "Closing chat window, sir. I'm still monitoring the system and ready to assist at any moment.",
+            
+            # Confirmation & Acknowledgment
+            "yes": "Affirmative, sir. Proceeding with the requested operation.",
+            "no": "Understood, sir. Operation cancelled. Is there something else I can help you with?",
+            "ok": "Acknowledged, sir. Standing by for your next instruction.",
+            "okay": "Confirmed, sir. How else may I assist you?",
+            "sure": "Certainly, sir. I'll proceed with that request.",
+            "proceed": "Proceeding as requested, sir.",
+            
+            # Capabilities Demonstration
+            "demo": "I can demonstrate ANALCONTROL capabilities by: 1) Navigating to different tabs, 2) Showing system status, 3) Executing commands, 4) Managing clients. What would you like to see demonstrated?",
+            
+            "tutorial": "I can provide tutorials on: Client Management, Command Execution, Python Scripts, Screenshot Capture, Recording Management, Log Analysis, or Chat System. Which topic interests you?",
+            
+            "guide": "I can guide you through any ANALCONTROL feature. Would you like help with: Navigation, Client Operations, System Monitoring, Communication, or Advanced Features?",
+            
+            # Advanced Operations
+            "automate": "ANALCONTROL supports automation through: Scheduled screenshots, Auto-recordings, Bulk command execution, and Script scheduling. What would you like to automate?",
+            
+            "schedule": "You can schedule: Recurring screenshots, Automated recordings, Periodic system checks, or Timed command execution. What task would you like to schedule?",
+            
+            "bulk": "Bulk operations available: Screenshot all clients, Record all screens, Execute command on multiple clients, or Batch script execution. Which bulk operation do you need?",
+            
+            "export": "You can export: System logs to CSV, Screenshot gallery, Recording library metadata, or Client statistics. What would you like to export?",
+            
+            # Performance & Optimization
+            "slow": "If the system seems slow, I can help optimize: 1) Clear old logs, 2) Reduce refresh intervals, 3) Close inactive client connections, 4) Optimize data queries. Would you like me to run diagnostics?",
+            
+            "optimize": "System optimization options: Clear caches, Reduce log retention, Optimize database queries, Adjust refresh rates. What would you like to optimize?",
+            
+            "performance": "Checking system performance metrics: CPU usage, Memory consumption, Network bandwidth, WebSocket connections. Would you like a detailed performance report?",
+            
+            # Default fallback with context awareness
+            "default": "I understand you're asking about ANALCONTROL operations. I can assist with: Website navigation, Client management, Command execution, System monitoring, and Communication features. Could you provide more specific details about what you need help with, sir?"
         }
     
     def get_response(self, message: str, context: Dict = None) -> str:
-        """Get AI response using local pattern matching with similarity"""
+        """Get AI response with context awareness"""
         message_lower = message.lower().strip()
+        context = context or {}
         
-        # Direct pattern matching first
+        # Direct pattern matching
         for pattern, response in self.patterns.items():
             if pattern in message_lower:
-                return response
+                return self._personalize_response(response, context)
         
-        # Try partial matching with similarity
+        # Fuzzy matching with word overlap
         best_match = None
         best_score = 0
         
         for pattern, response in self.patterns.items():
-            # Simple word overlap scoring
-            pattern_words = set(pattern.split())
-            message_words = set(message_lower.split())
-            common_words = pattern_words.intersection(message_words)
-            
-            if common_words:
-                score = len(common_words) / max(len(pattern_words), len(message_words))
-                if score > best_score:
-                    best_score = score
-                    best_match = response
+            score = self._calculate_similarity(pattern, message_lower)
+            if score > best_score and score > self.similarity_threshold:
+                best_score = score
+                best_match = response
         
-        if best_score > 0.2:  # Threshold for partial matches
-            return best_match
+        if best_match:
+            return self._personalize_response(best_match, context)
         
-        # Contextual response based on keywords
+        # Keyword-based contextual responses
         keywords = {
-            'tab': "Which tab would you like to open? I can navigate to: Clients, Commands, Python, Screenshots, Recordings, Logs, or Chat.",
-            'client': "I can help with client management. Would you like to view clients, execute commands, capture screenshots, or get system info?",
-            'command': "I can execute commands on clients. What would you like to run? Screenshot, system info, recording, or custom command?",
-            'python': "The Python tab allows script execution on clients. Would you like to write code, use templates, or view execution history?",
-            'screenshot': "I can capture screenshots from clients. Specify a client or say 'all' for all connected systems.",
-            'recording': "I can record client screens. Set duration in seconds or say 'live' for streaming.",
-            'log': "The Logs tab shows system activity. Would you like to view, filter, or export logs?",
-            'chat': "I can open the chat interface. Would you like global chat or to message a specific user/client?",
-            'refresh': "Refreshing system data. Specify what to refresh: all, clients, screenshots, recordings, logs, or commands.",
-            'status': "Checking system status. I can show connection count, online clients, active streams, and system health.",
-            'help': "I can help with all ANALCONTROL features. Be specific about what you need assistance with.",
-            'how': "I'll guide you through the process. What would you like to learn how to do?",
-            'what': "I'll explain that feature. What specifically would you like to know about?",
-            'why': "Let me explain the purpose and benefits of that feature.",
-            'where': "I'll show you where to find that in the interface.",
-            'when': "I can tell you when that feature is available or how to schedule it.",
+            'tab': "Which tab would you like to access? Available tabs: Clients, Commands, Python, Screenshots, Recordings, Logs, Chat.",
+            'client': "I can help with client operations. Options: View clients, Execute commands, Capture screenshots, Get system info, Start recordings, Live stream. What would you like to do?",
+            'command': "For command execution, I can: Execute predefined commands, Run custom commands, Execute Python scripts, or Perform bulk operations. What command operation do you need?",
+            'python': "Python capabilities include: Script editor, Template library, Remote execution, Result viewing, or History. What Python operation interests you?",
+            'screenshot': "Screenshot operations: Capture single client, Capture all clients, View gallery, Download images, or Delete screenshots. What would you like to do?",
+            'recording': "Recording options: Start recording, Stop recording, View library, Play recordings, or Download videos. Which recording operation?",
+            'log': "Log management features: View logs, Filter by type/client, Export logs, or Clear history. What log operation do you need?",
+            'chat': "Chat capabilities: Global chat, Private messaging, Client communication, or User management. Which chat feature?",
+            'refresh': "Refresh options: All data, Specific tab, Client list, Statistics, or Logs. What needs refreshing?",
+            'status': "Status information: System health, Client status, Connection metrics, Performance stats, or Service availability. What status do you need?",
+            'help': "I can provide detailed help on any ANALCONTROL feature. Be specific about what you'd like assistance with.",
+            'how': "I'll guide you through the process step-by-step. What specific task do you need help with?",
+            'what': "I'll explain that feature in detail. What would you specifically like to know about?",
+            'where': "I'll show you where to find that in the interface. What are you looking for?",
+            'when': "I can tell you when features are available or help you schedule operations. What timing information do you need?",
+            'why': "Let me explain the purpose and benefits of that feature. What would you like to understand better?",
         }
         
         for keyword, response in keywords.items():
             if keyword in message_lower:
-                return response
+                return self._personalize_response(response, context)
         
-        # Enhanced default response with suggestions
+        # Enhanced default with suggestions
         suggestions = [
             "Show me connected clients",
             "Take a screenshot",
-            "Open Python tab", 
-            "Start recording",
+            "Open Python tab",
             "Check system status",
-            "Open chat interface"
+            "View system logs",
+            "Start screen recording"
         ]
         
-        random_suggestion = random.choice(suggestions)
+        suggestion = random.choice(suggestions)
         
         return f"""I understand you're asking about "{message}". 
 
-I can help you with ANALCONTROL v4.0 operations:
+I can assist you with ANALCONTROL v4.0 comprehensive operations:
 
-• **Navigation**: Switch between all 7 tabs
-• **Client Control**: Monitor, command, and capture from clients  
-• **System Management**: View logs, check status, manage data
-• **Communication**: Chat with users and clients
-• **Automation**: Schedule tasks and auto-capture
+• **Navigation**: Access any of the 7 tabs
+• **Client Control**: Monitor, command, and capture from clients
+• **System Management**: Logs, status, performance metrics
+• **Communication**: Chat, messaging, notifications
+• **Automation**: Scheduled tasks, bulk operations
 
-Try saying something like:
-• "{random_suggestion}"
+Try asking:
+• "{suggestion}"
 • "What can you do?"
-• "Help me with [specific task]"
+• "Help with [specific task]"
 
-Or be more specific about what you'd like to accomplish."""
+Or provide more details about what you'd like to accomplish, sir."""
 
-# Initialize local AI
+    def _calculate_similarity(self, pattern: str, message: str) -> float:
+        """Calculate similarity score between pattern and message"""
+        pattern_words = set(pattern.split())
+        message_words = set(message.split())
+        
+        if not pattern_words or not message_words:
+            return 0.0
+        
+        common_words = pattern_words.intersection(message_words)
+        return len(common_words) / max(len(pattern_words), len(message_words))
+    
+    def _personalize_response(self, response: str, context: Dict) -> str:
+        """Personalize response based on context"""
+        # Could add user name, current tab info, etc.
+        current_tab = context.get('current_tab', 'dashboard')
+        
+        # Add context-aware information if relevant
+        if '[Action:' not in response and current_tab != 'dashboard':
+            # User is already on a specific tab, acknowledge it
+            pass
+        
+        return response
+
+# Initialize Local AI
 local_ai = LocalAI()
 
 # ========== JARVIS PERSONALITY ENGINE ==========
 class JarvisPersonalityEngine:
-    """Adds personality and context to J.A.R.V.I.S. responses"""
+    """Adds personality and conversational context to J.A.R.V.I.S."""
     
     def __init__(self):
         self.conversation_history = []
-        self.user_preferences = {}
-        
+        self.max_history = 100
+        self.personality_traits = {
+            'formal': True,
+            'helpful': True,
+            'efficient': True,
+            'professional': True
+        }
+    
     def enhance_response(self, response: str) -> str:
         """Add personality touches to response"""
-        # Add occasional personality flair
-        if random.random() < 0.1:  # 10% chance
-            prefixes = [
-                "Certainly, sir. ",
-                "Right away. ",
-                "Of course. ",
-                "Immediately, sir. ",
-                "At once. "
-            ]
-            response = random.choice(prefixes) + response
-        
+        # Already well-formatted responses from LocalAI
         return response
     
     def add_to_history(self, role: str, content: str):
-        """Add message to conversation history"""
+        """Track conversation history"""
         self.conversation_history.append({
-            "role": role,
-            "content": content,
-            "timestamp": datetime.utcnow().isoformat()
+            'role': role,
+            'content': content,
+            'timestamp': datetime.utcnow().isoformat()
         })
         
-        # Keep only last 50 messages
-        if len(self.conversation_history) > 50:
-            self.conversation_history = self.conversation_history[-50:]
+        if len(self.conversation_history) > self.max_history:
+            self.conversation_history = self.conversation_history[-self.max_history:]
+    
+    def get_context_summary(self) -> str:
+        """Get summary of recent conversation"""
+        if not self.conversation_history:
+            return "No previous conversation"
+        
+        recent = self.conversation_history[-5:]
+        return f"Recent topics: {', '.join([h['content'][:30] for h in recent])}"
 
-# Initialize personality engine
 personality_engine = JarvisPersonalityEngine()
 
 # ========== JARVIS ACTION EXECUTOR ==========
 class JarvisActionExecutor:
+    """Parses and executes actions from AI responses"""
+    
     @staticmethod
     def parse_action_from_query(query: str, response: str, user_context: Dict = None) -> Optional[Dict]:
-        """Parse actions from query and response"""
+        """Extract actionable commands from query and response"""
         query_lower = query.lower()
         
-        # Extract action from response if marked
+        # Extract action markers from response
         if '[Action:' in response:
             action_match = re.search(r'\[Action:\s*(.*?)\]', response)
             if action_match:
                 action_text = action_match.group(1).lower()
                 
-                # Map action text to action types
-                action_map = {
+                action_mappings = {
                     'switch to clients': {'type': 'navigate', 'tab': 'clients'},
                     'switch to commands': {'type': 'navigate', 'tab': 'commands'},
                     'switch to python': {'type': 'navigate', 'tab': 'python'},
@@ -458,7 +751,9 @@ class JarvisActionExecutor:
                     'switch to logs': {'type': 'navigate', 'tab': 'logs'},
                     'switch to chat': {'type': 'navigate', 'tab': 'chat'},
                     'execute screenshot': {'type': 'command', 'command': 'screenshot'},
+                    'execute screenshot all': {'type': 'command', 'command': 'screenshot', 'target': 'all'},
                     'execute record_screen': {'type': 'command', 'command': 'record_screen'},
+                    'execute record_screen all': {'type': 'command', 'command': 'record_screen', 'target': 'all'},
                     'execute live_screen': {'type': 'command', 'command': 'live_screen'},
                     'execute system_info': {'type': 'command', 'command': 'system_info'},
                     'refresh all': {'type': 'refresh', 'target': 'all'},
@@ -466,106 +761,43 @@ class JarvisActionExecutor:
                     'check status': {'type': 'status', 'target': 'system'},
                 }
                 
-                if action_text in action_map:
-                    return action_map[action_text]
+                if action_text in action_mappings:
+                    return action_mappings[action_text]
         
-        # Fallback: determine action from query
-        if any(word in query_lower for word in ['show', 'open', 'switch', 'view', 'display']):
-            if 'client' in query_lower:
-                return {'type': 'navigate', 'tab': 'clients'}
-            elif 'command' in query_lower:
-                return {'type': 'navigate', 'tab': 'commands'}
-            elif 'python' in query_lower:
-                return {'type': 'navigate', 'tab': 'python'}
-            elif 'screenshot' in query_lower:
-                return {'type': 'navigate', 'tab': 'screenshots'}
-            elif any(word in query_lower for word in ['record', 'video']):
-                return {'type': 'navigate', 'tab': 'recordings'}
-            elif 'log' in query_lower:
-                return {'type': 'navigate', 'tab': 'logs'}
-            elif 'chat' in query_lower:
-                return {'type': 'navigate', 'tab': 'chat'}
+        # Fallback parsing from query keywords
+        navigation_keywords = {
+            'client': 'clients',
+            'command': 'commands',
+            'python': 'python',
+            'screenshot': 'screenshots',
+            'recording': 'recordings',
+            'log': 'logs',
+            'chat': 'chat'
+        }
         
-        elif any(word in query_lower for word in ['take', 'capture', 'grab']):
-            if 'screenshot' in query_lower:
-                return {'type': 'command', 'command': 'screenshot'}
+        for keyword, tab in navigation_keywords.items():
+            if any(word in query_lower for word in ['show', 'open', 'view', 'display']):
+                if keyword in query_lower:
+                    return {'type': 'navigate', 'tab': tab}
         
-        elif any(word in query_lower for word in ['record', 'start video']):
-            if 'screen' in query_lower or 'record' in query_lower:
-                return {'type': 'command', 'command': 'record_screen'}
+        # Action detection
+        if 'take' in query_lower and 'screenshot' in query_lower:
+            target = 'all' if 'all' in query_lower else None
+            return {'type': 'command', 'command': 'screenshot', 'target': target}
         
-        elif 'live' in query_lower or 'stream' in query_lower:
+        if 'record' in query_lower and ('screen' in query_lower or 'video' in query_lower):
+            return {'type': 'command', 'command': 'record_screen'}
+        
+        if 'live' in query_lower or 'stream' in query_lower:
             return {'type': 'command', 'command': 'live_screen'}
         
-        elif any(word in query_lower for word in ['refresh', 'update', 'reload']):
+        if any(word in query_lower for word in ['refresh', 'update', 'reload', 'sync']):
             return {'type': 'refresh', 'target': 'all'}
         
-        elif 'status' in query_lower or 'health' in query_lower:
+        if 'status' in query_lower or 'health' in query_lower:
             return {'type': 'status', 'target': 'system'}
         
         return None
-
-# ========== JARVIS WEBSITE CONTROLLER ==========
-class JarvisWebsiteController:
-    def __init__(self, token: str = None, user: Dict = None):
-        self.token = token
-        self.user = user
-    
-    async def execute_action(self, action: Dict) -> Dict:
-        """Execute website action"""
-        if not action:
-            return {"success": False, "error": "No action specified"}
-        
-        action_type = action.get("type")
-        
-        actions = {
-            'navigate': "Navigating to tab",
-            'command': "Executing command",
-            'refresh': "Refreshing data",
-            'status': "Checking status"
-        }
-        
-        description = actions.get(action_type, "Performing action")
-        
-        return {
-            "success": True,
-            "action": action,
-            "description": description,
-            "message": f"Action '{action_type}' queued for execution",
-            "timestamp": datetime.utcnow().isoformat()
-        }
-
-# ========== STRUCTURED LOGGER ==========
-class StructuredLogger:
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
-    
-    def log_api_call(self, endpoint: str, user: str, status: str, details: dict = None):
-        """Log API calls with structured data"""
-        log_data = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "endpoint": endpoint,
-            "user": user,
-            "status": status,
-            "details": details or {}
-        }
-        self.logger.info(json.dumps(log_data))
-    
-    def log_command(self, command_id: str, client_id: str, command: str, user: str, status: str):
-        """Log command execution"""
-        log_data = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "type": "command",
-            "command_id": command_id,
-            "client_id": client_id,
-            "command": command,
-            "user": user,
-            "status": status
-        }
-        self.logger.info(json.dumps(log_data))
-
-# Initialize structured logger
-structured_logger = StructuredLogger()
 
 # ========== DATA MODELS ==========
 class LoginRequest(BaseModel):
@@ -573,65 +805,33 @@ class LoginRequest(BaseModel):
     password: str = Field(..., example="admin123")
 
 class UserCreate(BaseModel):
-    email: str = Field(..., example="newadmin")
-    password: str = Field(..., example="password123")
-    confirm_password: str = Field(..., example="password123")
-    is_admin: bool = Field(default=True)
-    theme: str = Field(default="red_black")
-
-class UserUpdate(BaseModel):
-    is_active: Optional[bool] = None
-    is_admin: Optional[bool] = None
-    theme: Optional[str] = None
+    email: str
+    password: str
+    confirm_password: str
+    is_admin: bool = True
+    theme: str = "red_black"
 
 class ClientRegister(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    name: str = Field(..., example="Office Computer")
-    ip_address: str = Field(..., example="192.168.1.100")
-    os_info: str = Field(default="Unknown", example="Windows 11")
-    hardware_info: Optional[Dict] = Field(default_factory=dict)
+    client_id: str
+    name: str
+    ip_address: str
+    os_info: str = "Unknown"
 
 class CommandRequest(BaseModel):
-    client_id: str = Field(..., min_length=1, max_length=100)
-    command: str = Field(..., min_length=1, max_length=100)
+    client_id: str
+    command: str
     parameters: Dict[str, Any] = Field(default_factory=dict)
-    
-    @validator('command')
-    def validate_command(cls, v):
-        allowed_commands = ['screenshot', 'system_info', 'custom', 'restart', 
-                           'shutdown', 'record_screen', 'live_screen']
-        if v not in allowed_commands and not v.startswith('custom_'):
-            raise ValueError(f'Command must be one of: {", ".join(allowed_commands)}')
-        return v
 
 class PythonExecutionRequest(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    filename: str = Field(..., example="script.py")
-    content: str = Field(..., description="Python code content")
+    client_id: str
+    filename: str
+    content: str
     parameters: Optional[List[str]] = Field(default_factory=list)
-    timeout: int = Field(default=30, description="Execution timeout in seconds")
-    allow_imports: bool = Field(default=True, description="Allow importing modules")
-    restricted_mode: bool = Field(default=True, description="Enable restricted execution mode")
-
-class ScreenshotRequest(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    image_data: str = Field(..., description="Base64 encoded image")
-    filename: str = Field(..., example="screenshot.png")
-
-class RecordingRequest(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    video_data: str = Field(..., description="Base64 encoded video")
-    filename: str = Field(..., example="recording.mp4")
-    duration: int = Field(default=30)
-    fps: int = Field(default=30)
-
-class SystemInfoRequest(BaseModel):
-    client_id: str = Field(..., example="client-001")
-    info: Dict[str, Any] = Field(default_factory=dict)
+    timeout: int = 30
 
 class ChatMessage(BaseModel):
-    message: str = Field(..., description="Message content")
-    recipient: Optional[str] = Field(None, description="Recipient user ID (null for all)")
+    message: str
+    recipient: Optional[str] = None
 
 class JarvisChatRequest(BaseModel):
     message: str
@@ -644,22 +844,22 @@ class JarvisChatResponse(BaseModel):
     model: str
     timestamp: str
 
-# ========== AI PROCESSING FUNCTION ==========
+# ========== AI PROCESSING ==========
 async def process_with_local_ai(message: str, context: Dict = None) -> Dict:
-    """Process message using local AI"""
+    """Process message through Local AI with personality"""
     context = context or {}
     
-    # Get response from local AI
+    # Get base response from Local AI
     ai_response = local_ai.get_response(message, context)
     
-    # Enhance with JARVIS personality
+    # Enhance with personality
     enhanced_response = personality_engine.enhance_response(ai_response)
     
-    # Add to history
+    # Track conversation
     personality_engine.add_to_history("user", message)
     personality_engine.add_to_history("assistant", enhanced_response)
     
-    # Determine if action needed
+    # Parse for actions
     action = JarvisActionExecutor.parse_action_from_query(message, enhanced_response, context)
     
     return {
@@ -670,732 +870,296 @@ async def process_with_local_ai(message: str, context: Dict = None) -> Dict:
         "timestamp": datetime.utcnow().isoformat()
     }
 
-# ========== SECURITY FUNCTIONS ==========
-def create_jwt_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Create JWT token"""
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(hours=24)
+# ========== WEBSOCKET MANAGER ==========
+class ConnectionManager:
+    """Manages WebSocket connections"""
     
-    to_encode.update({
-        "exp": expire,
-        "iat": datetime.utcnow(),
-    })
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm="HS256")
-    return encoded_jwt
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+        self.client_connections: Dict[str, WebSocket] = {}
+        
+    async def connect(self, websocket: WebSocket, connection_id: str, connection_type: str = "admin"):
+        """Accept and store WebSocket connection"""
+        await websocket.accept()
+        
+        if connection_type == "client":
+            self.client_connections[connection_id] = websocket
+            # Update client status in database
+            client = db.get_client(connection_id)
+            if client:
+                client['ws_online'] = True
+        else:
+            self.active_connections[connection_id] = websocket
+        
+        logger.info(f"WebSocket connected: {connection_id} ({connection_type})")
+    
+    def disconnect(self, connection_id: str, connection_type: str = "admin"):
+        """Remove WebSocket connection"""
+        if connection_type == "client":
+            if connection_id in self.client_connections:
+                del self.client_connections[connection_id]
+                # Update client status
+                client = db.get_client(connection_id)
+                if client:
+                    client['ws_online'] = False
+        else:
+            if connection_id in self.active_connections:
+                del self.active_connections[connection_id]
+        
+        logger.info(f"WebSocket disconnected: {connection_id} ({connection_type})")
+    
+    async def send_personal_message(self, message: str, connection_id: str):
+        """Send message to specific connection"""
+        websocket = self.active_connections.get(connection_id) or self.client_connections.get(connection_id)
+        if websocket:
+            await websocket.send_text(message)
+    
+    async def broadcast(self, message: str, exclude: List[str] = None):
+        """Broadcast message to all admin connections"""
+        exclude = exclude or []
+        for conn_id, websocket in self.active_connections.items():
+            if conn_id not in exclude:
+                try:
+                    await websocket.send_text(message)
+                except:
+                    pass
+    
+    async def broadcast_to_clients(self, message: str, client_ids: List[str] = None):
+        """Broadcast to specific clients or all clients"""
+        targets = client_ids or list(self.client_connections.keys())
+        for client_id in targets:
+            if client_id in self.client_connections:
+                try:
+                    await self.client_connections[client_id].send_text(message)
+                except:
+                    pass
 
-def verify_jwt_token(token: str) -> Optional[dict]:
-    """Verify JWT token"""
+manager = ConnectionManager()
+
+# ========== UTILITY FUNCTIONS ==========
+def verify_jwt_token(token: str) -> Optional[Dict]:
+    """Verify and decode JWT token"""
     try:
         payload = jwt.decode(
-            token, 
-            JWT_SECRET_KEY, 
+            token,
+            JWT_SECRET_KEY,
             algorithms=["HS256"],
             options={"verify_exp": True}
         )
         return payload
     except jwt.ExpiredSignatureError:
-        logger.warning("JWT token expired")
+        logger.warning("Expired JWT token")
         return None
-    except jwt.InvalidTokenError as e:
-        logger.warning(f"Invalid JWT token: {e}")
+    except jwt.InvalidTokenError:
+        logger.warning("Invalid JWT token")
+        return None
+    except Exception as e:
+        logger.error(f"JWT verification error: {e}")
         return None
 
-async def authenticate_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    """Verify JWT token from request"""
-    if not credentials:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    token = credentials.credentials
-    payload = verify_jwt_token(token)
-    
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict:
+    """Get current authenticated user"""
+    payload = verify_jwt_token(credentials.credentials)
     if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
     return payload
 
-# ========== SUPABASE HELPER FUNCTIONS ==========
-def hash_password(password: str) -> str:
-    """Hash password using SHA256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+# ========== API ENDPOINTS ==========
 
-async def verify_supabase_user(email: str, password: str) -> Optional[dict]:
-    """Verify user credentials against Supabase"""
-    if not supabase:
-        logger.error("Supabase not initialized")
-        return None
-    
-    try:
-        # Query users table
-        response = supabase.table("users")\
-            .select("*")\
-            .eq("email", email.lower())\
-            .eq("is_active", True)\
-            .execute()
-        
-        if not response.data or len(response.data) == 0:
-            return None
-        
-        user_data = response.data[0]
-        
-        # Verify password
-        hashed_input = hash_password(password)
-        
-        # Check stored hash or plain text (for compatibility)
-        stored_password = user_data.get("password_hash") or user_data.get("password")
-        
-        if stored_password and (stored_password == hashed_input or stored_password == password):
-            
-            # Update last login
-            supabase.table("users")\
-                .update({"last_login": datetime.utcnow().isoformat()})\
-                .eq("id", user_data["id"])\
-                .execute()
-            
-            return {
-                "id": user_data["id"],
-                "email": user_data["email"],
-                "is_admin": user_data.get("is_admin", False),
-                "theme": user_data.get("theme", "red_black"),
-                "is_active": user_data.get("is_active", True)
-            }
-    
-    except Exception as e:
-        logger.error(f"Supabase auth error: {e}")
-    
-    return None
-
-async def create_supabase_user(user_data: dict) -> Optional[dict]:
-    """Create new user in Supabase"""
-    if not supabase:
-        return None
-    
-    try:
-        # Check if user exists
-        existing = supabase.table("users")\
-            .select("*")\
-            .eq("email", user_data["email"].lower())\
-            .execute()
-        
-        if existing.data and len(existing.data) > 0:
-            return None
-        
-        # Create user
-        new_user = {
-            "id": str(uuid.uuid4()),
-            "email": user_data["email"].lower(),
-            "password_hash": hash_password(user_data["password"]),
-            "is_admin": user_data.get("is_admin", False),
-            "theme": user_data.get("theme", "red_black"),
-            "is_active": True,
-            "created_at": datetime.utcnow().isoformat(),
-            "last_login": None
-        }
-        
-        response = supabase.table("users").insert(new_user).execute()
-        
-        if response.data:
-            return {
-                "id": response.data[0]["id"],
-                "email": response.data[0]["email"],
-                "is_admin": response.data[0].get("is_admin", False),
-                "theme": response.data[0].get("theme", "red_black")
-            }
-    
-    except Exception as e:
-        logger.error(f"Create Supabase user error: {e}")
-    
-    return None
-
-# ========== IN-MEMORY DATABASE ==========
-class Database:
-    def __init__(self):
-        self.users = {}
-        self.clients = {}
-        self.commands = []
-        self.logs = []
-        self.sessions = {}
-        self.chat_messages = []
-        self.user_tags = {}
-        self.screenshots = []
-        self.recordings = []
-        self.client_heartbeats = {}
-        self.system_info = []
-        self.init_default_data()
-        self.init_user_tags()
-    
-    def init_default_data(self):
-        # Default users with red/black theme
-        default_users = [
-            {
-                "id": str(uuid.uuid4()),
-                "email": "xotiic",
-                "password": "40671Mps19*",
-                "is_admin": True,
-                "is_active": True,
-                "theme": "red_black",
-                "created_at": datetime.utcnow().isoformat(),
-                "last_login": None
-            },
-            {
-                "id": str(uuid.uuid4()),
-                "email": "admin",
-                "password": "admin123",
-                "is_admin": True,
-                "is_active": True,
-                "theme": "red_black",
-                "created_at": datetime.utcnow().isoformat(),
-                "last_login": None
-            },
-            {
-                "id": str(uuid.uuid4()),
-                "email": "kizer",
-                "password": "kidraper67",
-                "is_admin": True,
-                "is_active": True,
-                "theme": "red_black",
-                "created_at": datetime.utcnow().isoformat(),
-                "last_login": None
-            },
-            {
-                "id": str(uuid.uuid4()),
-                "email": "nathan",
-                "password": "femboy67",
-                "is_admin": True,
-                "is_active": True,
-                "theme": "red_black",
-                "created_at": datetime.utcnow().isoformat(),
-                "last_login": None
-            }
-        ]
-        
-        for user in default_users:
-            self.users[user["email"].lower()] = user
-        
-        # Default client
-        self.clients["default"] = {
-            "id": str(uuid.uuid4()),
-            "client_id": "default",
-            "name": "Default Client",
-            "ip_address": "127.0.0.1",
-            "os_info": "Windows 11",
-            "hardware_info": {},
-            "online": False,
-            "ws_online": False,
-            "last_seen": datetime.utcnow().isoformat(),
-            "registered_at": datetime.utcnow().isoformat()
-        }
-    
-    def init_user_tags(self):
-        self.user_tags["xotiic"] = {
-            "user_id": "xotiic",
-            "role": "owner",
-            "color": "#ff0000",
-            "can_create_accounts": True
-        }
-        self.user_tags["kizer"] = {
-            "user_id": "kizer",
-            "role": "sr_admin",
-            "color": "#ff9900",
-            "can_create_accounts": False
-        }
-        self.user_tags["nathan"] = {
-            "user_id": "nathan",
-            "role": "admin",
-            "color": "#ff55ff",
-            "can_create_accounts": False
-        }
-    
-    def get_user_by_email(self, email: str):
-        return self.users.get(email.lower())
-    
-    def update_user_last_login(self, email: str):
-        user = self.get_user_by_email(email)
-        if user:
-            user["last_login"] = datetime.utcnow().isoformat()
-    
-    def add_chat_message(self, message_data: dict):
-        message_id = str(uuid.uuid4())
-        message_data["id"] = message_id
-        message_data["timestamp"] = datetime.utcnow().isoformat()
-        message_data["read_by"] = [message_data["sender"]]
-        self.chat_messages.append(message_data)
-        return message_data
-    
-    def get_user_tag(self, user_id: str):
-        return self.user_tags.get(user_id.lower())
-    
-    def add_screenshot(self, screenshot_data: dict):
-        screenshot_id = str(uuid.uuid4())
-        screenshot_data["id"] = screenshot_id
-        screenshot_data["created_at"] = datetime.utcnow().isoformat()
-        self.screenshots.append(screenshot_data)
-        return screenshot_data
-    
-    def add_recording(self, recording_data: dict):
-        recording_id = str(uuid.uuid4())
-        recording_data["id"] = recording_id
-        recording_data["created_at"] = datetime.utcnow().isoformat()
-        self.recordings.append(recording_data)
-        return recording_data
-    
-    def update_client_heartbeat(self, client_id: str):
-        """Update client heartbeat timestamp"""
-        self.client_heartbeats[client_id] = datetime.utcnow().timestamp()
-    
-    def is_client_alive(self, client_id: str, timeout: int = 60) -> bool:
-        """Check if client is alive based on heartbeat"""
-        last_heartbeat = self.client_heartbeats.get(client_id)
-        if not last_heartbeat:
-            return False
-        return (datetime.utcnow().timestamp() - last_heartbeat) < timeout
-
-# Initialize database
-db = Database()
-
-# ========== MEDIA HELPER FUNCTIONS ==========
-def get_media_type(filename: str) -> str:
-    """Get proper media type from filename"""
-    ext = filename.lower().split('.')[-1]
-    media_types = {
-        'png': 'image/png',
-        'jpg': 'image/jpeg',
-        'jpeg': 'image/jpeg',
-        'gif': 'image/gif',
-        'mp4': 'video/mp4',
-        'webm': 'video/webm',
-        'avi': 'video/x-msvideo',
-        'mov': 'video/quicktime'
-    }
-    return media_types.get(ext, 'application/octet-stream')
-
-# ========== WEBSOCKET MANAGER ==========
-class ConnectionManager:
-    def __init__(self):
-        self.client_connections: Dict[str, WebSocket] = {}
-        self.admin_connections: List[WebSocket] = []
-        self.chat_connections: Dict[str, WebSocket] = {}
-        self.connection_times: Dict[str, float] = {}
-        self.pending_messages: Dict[str, List[dict]] = {}
-        self.active_recordings: Dict[str, bool] = {}
-        self.active_streams: Dict[str, bool] = {}
-        self.auto_screenshots: Dict[str, bool] = {}
-        self.auto_recordings: Dict[str, bool] = {}
-
-    async def connect_admin(self, websocket: WebSocket):
-        await websocket.accept()
-        self.admin_connections.append(websocket)
-        logger.info(f"👑 Admin connected. Total admins: {len(self.admin_connections)}")
-
-    async def connect_client(self, websocket: WebSocket, client_id: str):
-        await websocket.accept()
-        self.client_connections[client_id] = websocket
-        self.connection_times[client_id] = time.time()
-        logger.info(f"🖥️  Client connected: {client_id}. Total clients: {len(self.client_connections)}")
-        
-        # Update client status
-        if client_id in db.clients:
-            db.clients[client_id]["online"] = True
-            db.clients[client_id]["ws_online"] = True
-            db.clients[client_id]["last_seen"] = datetime.utcnow().isoformat()
-        
-        # Store in Supabase
-        if supabase:
-            try:
-                supabase.table("clients")\
-                    .update({
-                        "online": True,
-                        "ws_online": True,
-                        "last_seen": datetime.utcnow().isoformat()
-                    })\
-                    .eq("client_id", client_id)\
-                    .execute()
-            except Exception as e:
-                logger.error(f"Supabase update client error: {e}")
-        
-        # Send pending messages if any
-        if client_id in self.pending_messages:
-            for msg in self.pending_messages[client_id]:
-                await self.send_to_client(client_id, msg)
-            del self.pending_messages[client_id]
-        
-        # Notify admins
-        await self.notify_admins({
-            "type": "client_connected",
-            "client_id": client_id,
-            "timestamp": datetime.utcnow().isoformat(),
-            "total_clients": len(self.client_connections)
-        })
-
-    async def connect_chat(self, websocket: WebSocket, user_id: str):
-        await websocket.accept()
-        self.chat_connections[user_id] = websocket
-        logger.info(f"💬 Chat connected: {user_id}. Total chat users: {len(self.chat_connections)}")
-        
-        # Notify others
-        await self.broadcast_chat({
-            "type": "user_online",
-            "user_id": user_id,
-            "timestamp": datetime.utcnow().isoformat()
-        }, exclude_user=user_id)
-        
-        # Send initial data
-        await self.send_chat_history(user_id)
-        await self.send_user_list(user_id)
-    
-    async def send_chat_history(self, user_id: str):
-        """Send chat history to user"""
-        if user_id in self.chat_connections:
-            try:
-                messages = db.chat_messages[-50:] if len(db.chat_messages) > 50 else db.chat_messages
-                
-                await self.chat_connections[user_id].send_json({
-                    "type": "chat_history",
-                    "messages": messages,
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-            except Exception as e:
-                logger.error(f"Error sending chat history: {e}")
-    
-    async def send_user_list(self, user_id: str):
-        """Send online user list"""
-        if user_id in self.chat_connections:
-            try:
-                online_users = list(self.chat_connections.keys())
-                user_data = []
-                
-                for uid in online_users:
-                    user = db.get_user_by_email(uid) or next((u for u in db.users.values() if u["email"] == uid), None)
-                    if user:
-                        tag = db.get_user_tag(user["email"])
-                        user_data.append({
-                            "user_id": user["email"],
-                            "username": user["email"],
-                            "role": tag["role"] if tag else "user",
-                            "color": tag["color"] if tag else "#ff2a2a",
-                            "online": True
-                        })
-                
-                await self.chat_connections[user_id].send_json({
-                    "type": "user_list",
-                    "users": user_data,
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-            except Exception as e:
-                logger.error(f"Error sending user list: {e}")
-
-    def disconnect(self, websocket: WebSocket):
-        # Remove from admin connections
-        if websocket in self.admin_connections:
-            self.admin_connections.remove(websocket)
-            logger.info(f"👑 Admin disconnected. Total admins: {len(self.admin_connections)}")
-        
-        # Remove from client connections
-        client_id = None
-        for cid, ws in self.client_connections.items():
-            if ws == websocket:
-                client_id = cid
-                break
-        
-        if client_id:
-            # Stop any active features
-            self.stop_streaming(client_id)
-            self.stop_auto_screenshots(client_id)
-            self.stop_auto_recordings(client_id)
-            
-            del self.client_connections[client_id]
-            if client_id in self.connection_times:
-                del self.connection_times[client_id]
-            
-            logger.info(f"🖥️  Client disconnected: {client_id}. Total clients: {len(self.client_connections)}")
-            
-            # Update client status
-            if client_id in db.clients:
-                db.clients[client_id]["online"] = False
-                db.clients[client_id]["ws_online"] = False
-            
-            # Update Supabase
-            if supabase:
-                try:
-                    supabase.table("clients")\
-                        .update({
-                            "ws_online": False
-                        })\
-                        .eq("client_id", client_id)\
-                        .execute()
-                except Exception as e:
-                    logger.error(f"Supabase update client offline error: {e}")
-            
-            # Notify admins
-            asyncio.create_task(self.notify_admins({
-                "type": "client_disconnected",
-                "client_id": client_id,
-                "timestamp": datetime.utcnow().isoformat(),
-                "total_clients": len(self.client_connections)
-            }))
-        
-        # Remove from chat connections
-        chat_user_id = None
-        for uid, ws in self.chat_connections.items():
-            if ws == websocket:
-                chat_user_id = uid
-                break
-        
-        if chat_user_id:
-            del self.chat_connections[chat_user_id]
-            logger.info(f"💬 Chat disconnected: {chat_user_id}. Total chat users: {len(self.chat_connections)}")
-            
-            # Notify others
-            asyncio.create_task(self.broadcast_chat({
-                "type": "user_offline",
-                "user_id": chat_user_id,
-                "timestamp": datetime.utcnow().isoformat()
-            }))
-
-    async def notify_admins(self, message: dict):
-        """Send message to all admin connections"""
-        disconnected = []
-        for connection in self.admin_connections:
-            try:
-                await connection.send_json(message)
-            except Exception as e:
-                logger.error(f"Failed to send to admin: {e}")
-                disconnected.append(connection)
-        
-        # Remove disconnected admins
-        for connection in disconnected:
-            if connection in self.admin_connections:
-                self.admin_connections.remove(connection)
-
-    async def send_to_client(self, client_id: str, message: dict) -> bool:
-        """Send message to specific client"""
-        if client_id in self.client_connections:
-            try:
-                await self.client_connections[client_id].send_json(message)
-                return True
-            except Exception as e:
-                logger.error(f"Failed to send to client {client_id}: {e}")
-                # Remove disconnected client
-                if client_id in self.client_connections:
-                    del self.client_connections[client_id]
-                # Store message for later delivery
-                if client_id not in self.pending_messages:
-                    self.pending_messages[client_id] = []
-                self.pending_messages[client_id].append(message)
-                return False
-        
-        # Client not connected, store message
-        if client_id not in self.pending_messages:
-            self.pending_messages[client_id] = []
-        self.pending_messages[client_id].append(message)
-        return False
-    
-    async def broadcast_chat(self, message: dict, exclude_user: str = None):
-        """Send message to all chat users except specified user"""
-        disconnected = []
-        for uid, connection in self.chat_connections.items():
-            if uid != exclude_user:
-                try:
-                    await connection.send_json(message)
-                except Exception as e:
-                    logger.error(f"Failed to send chat to {uid}: {e}")
-                    disconnected.append(uid)
-        
-        # Remove disconnected users
-        for uid in disconnected:
-            if uid in self.chat_connections:
-                del self.chat_connections[uid]
-    
-    async def send_to_user(self, user_id: str, message: dict) -> bool:
-        """Send message to specific user"""
-        if user_id in self.chat_connections:
-            try:
-                await self.chat_connections[user_id].send_json(message)
-                return True
-            except Exception as e:
-                logger.error(f"Failed to send to user {user_id}: {e}")
-                return False
-        return False
-    
-    def start_recording(self, client_id: str):
-        """Mark client as recording"""
-        self.active_recordings[client_id] = True
-    
-    def stop_recording(self, client_id: str):
-        """Stop recording on client"""
-        self.active_recordings.pop(client_id, None)
-    
-    def is_recording(self, client_id: str) -> bool:
-        """Check if client is recording"""
-        return self.active_recordings.get(client_id, False)
-    
-    def start_streaming(self, client_id: str):
-        """Mark client as streaming"""
-        self.active_streams[client_id] = True
-    
-    def stop_streaming(self, client_id: str):
-        """Stop streaming on client"""
-        self.active_streams.pop(client_id, None)
-    
-    def is_streaming(self, client_id: str) -> bool:
-        """Check if client is streaming"""
-        return self.active_streams.get(client_id, False)
-    
-    def start_auto_screenshots(self, client_id: str):
-        """Mark client as auto-screenshotting"""
-        self.auto_screenshots[client_id] = True
-    
-    def stop_auto_screenshots(self, client_id: str):
-        """Stop auto screenshots on client"""
-        self.auto_screenshots.pop(client_id, None)
-    
-    def is_auto_screenshots(self, client_id: str) -> bool:
-        """Check if client is auto-screenshotting"""
-        return self.auto_screenshots.get(client_id, False)
-    
-    def start_auto_recordings(self, client_id: str):
-        """Mark client as auto-recording"""
-        self.auto_recordings[client_id] = True
-    
-    def stop_auto_recordings(self, client_id: str):
-        """Stop auto recordings on client"""
-        self.auto_recordings.pop(client_id, None)
-    
-    def is_auto_recordings(self, client_id: str) -> bool:
-        """Check if client is auto-recording"""
-        return self.auto_recordings.get(client_id, False)
-
-manager = ConnectionManager()
-
-# ========== CORE API ROUTES ==========
 @app.get("/")
 async def root():
+    """Root endpoint"""
     return {
-        "message": "ANALCONTROL v4.0 API with J.A.R.V.I.S. AI", 
+        "message": "ANALCONTROL v4.0 API with J.A.R.V.I.S. AI",
+        "version": "4.0.0",
         "status": "online",
-        "ai": "FREE Local AI - NO API KEYS REQUIRED",
-        "version": "4.0"
+        "features": [
+            "Client Monitoring",
+            "Command Execution",
+            "Screenshot Capture",
+            "Screen Recording",
+            "Live Streaming",
+            "Python Execution",
+            "Chat System",
+            "J.A.R.V.I.S. AI Assistant"
+        ]
     }
 
 @app.get("/api/health")
 async def health_check():
+    """Health check endpoint"""
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "services": {
             "api": "online",
-            "ai": "online (local)",
-            "database": "online" if supabase else "offline"
+            "database": "online",
+            "ai": "online",
+            "jarvis": "online",
+            "websocket": "online"
         },
-        "ai_info": {
-            "provider": "local_patterns",
-            "patterns_loaded": len(local_ai.patterns),
-            "free": True,
-            "requires_api_key": False
-        }
+        "stats": db.get_stats()
     }
 
 @app.post("/api/login")
-async def login(request: LoginRequest):
-    """Simple login for demo - in production, use proper auth"""
-    try:
-        logger.info(f"Login attempt for user: {request.email}")
-        
-        user_data = None
-        
-        # Try Supabase first
-        if supabase:
-            user_data = await verify_supabase_user(request.email, request.password)
-        
-        # Fallback to in-memory database
-        if not user_data:
-            user = db.get_user_by_email(request.email)
-            
-            if not user:
-                logger.warning(f"User not found: {request.email}")
-                raise HTTPException(status_code=401, detail="Invalid credentials")
-            
-            if not user.get("is_active", True):
-                logger.warning(f"User account inactive: {request.email}")
-                raise HTTPException(status_code=401, detail="Account is inactive")
-            
-            if user.get("password") != request.password:
-                logger.warning(f"Password verification failed for user: {request.email}")
-                raise HTTPException(status_code=401, detail="Invalid credentials")
-            
-            user_data = {
-                "id": user["id"],
-                "email": user["email"],
-                "is_admin": user.get("is_admin", False),
-                "theme": user.get("theme", "red_black"),
-                "is_active": user.get("is_active", True)
-            }
-            
-            db.update_user_last_login(request.email)
-        
-        logger.info(f"✅ User authenticated: {user_data.get('email')}")
-        
-        # Create JWT token
-        token_data = {
-            "sub": user_data["email"],
-            "email": user_data["email"],
-            "is_admin": user_data["is_admin"],
-            "user_id": user_data["id"],
-            "theme": user_data.get("theme", "red_black")
+async def login(email: str = Form(...), password: str = Form(...)):
+    """User login endpoint"""
+    user = db.users.get(email)
+    
+    if not user or user['password'] != password:
+        structured_logger.log_api_call("/api/login", email, "failed", {"reason": "invalid_credentials"})
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    # Create JWT token
+    token = jwt.encode({
+        "user_id": user['id'],
+        "email": user['email'],
+        "is_admin": user['is_admin'],
+        "exp": datetime.utcnow() + timedelta(hours=24)
+    }, JWT_SECRET_KEY, algorithm="HS256")
+    
+    structured_logger.log_api_call("/api/login", email, "success")
+    
+    return {
+        "success": True,
+        "token": token,
+        "user": {
+            "id": user['id'],
+            "email": user['email'],
+            "is_admin": user['is_admin'],
+            "theme": user['theme']
         }
-        
-        access_token = create_jwt_token(token_data)
-        
-        return {
-            "success": True,
-            "token": access_token,
-            "user": {
-                "email": user_data["email"],
-                "is_admin": user_data["is_admin"],
-                "user_id": user_data["id"],
-                "theme": user_data.get("theme", "red_black")
-            },
-            "expires_in": 86400
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Login error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+    }
 
-# ========== JARVIS AI ENDPOINTS ==========
+@app.get("/api/stats")
+async def get_stats(current_user: Dict = Depends(get_current_user)):
+    """Get system statistics"""
+    stats = db.get_stats()
+    structured_logger.log_api_call("/api/stats", current_user['email'], "success")
+    return {"success": True, "stats": stats}
+
+@app.get("/api/clients")
+async def get_clients(current_user: Dict = Depends(get_current_user)):
+    """Get all clients"""
+    clients = db.get_all_clients()
+    return {"success": True, "clients": clients}
+
+@app.post("/api/clients/register")
+async def register_client(client: ClientRegister):
+    """Register new client"""
+    client_data = client.dict()
+    registered_client = db.add_client(client_data)
+    
+    # Notify all admins
+    await manager.broadcast(json.dumps({
+        "type": "client_connected",
+        "client_id": registered_client['client_id'],
+        "data": registered_client
+    }))
+    
+    return {"success": True, "client": registered_client}
+
+@app.post("/api/command")
+async def execute_command(
+    command: CommandRequest,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Execute command on client"""
+    command_data = command.dict()
+    command_data['user_id'] = current_user['user_id']
+    command_data['user_email'] = current_user['email']
+    
+    # Save command
+    saved_command = db.add_command(command_data)
+    
+    # Try to send via WebSocket if client is online
+    if command.client_id in manager.client_connections:
+        await manager.send_personal_message(
+            json.dumps({
+                "type": "command",
+                "command_id": saved_command['id'],
+                "command": command.command,
+                "parameters": command.parameters
+            }),
+            command.client_id
+        )
+    
+    # Log
+    db.add_log({
+        "client_id": command.client_id,
+        "log_type": "info",
+        "message": f"Command '{command.command}' sent by {current_user['email']}"
+    })
+    
+    return {
+        "success": True,
+        "command_id": saved_command['id'],
+        "sent_via_websocket": command.client_id in manager.client_connections
+    }
+
+@app.get("/api/commands")
+async def get_commands(
+    limit: int = Query(50, ge=1, le=1000),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get command history"""
+    commands = db.commands[-limit:]
+    commands.reverse()
+    return {"success": True, "commands": commands}
+
+@app.get("/api/screenshots")
+async def get_screenshots(current_user: Dict = Depends(get_current_user)):
+    """Get all screenshots"""
+    screenshots = db.screenshots
+    screenshots.reverse()
+    return {"success": True, "screenshots": screenshots}
+
+@app.get("/api/recordings")
+async def get_recordings(current_user: Dict = Depends(get_current_user)):
+    """Get all recordings"""
+    recordings = db.recordings
+    recordings.reverse()
+    return {"success": True, "recordings": recordings}
+
+@app.get("/api/logs")
+async def get_logs(
+    limit: int = Query(100, ge=1, le=1000),
+    log_type: Optional[str] = None,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get system logs"""
+    logs = db.logs[-limit:]
+    
+    if log_type:
+        logs = [log for log in logs if log.get('log_type') == log_type]
+    
+    logs.reverse()
+    return {"success": True, "logs": logs}
+
+# ========== J.A.R.V.I.S. AI ENDPOINTS ==========
+
 @app.post("/api/jarvis/chat", response_model=JarvisChatResponse)
-async def jarvis_chat(request: JarvisChatRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Chat with J.A.R.V.I.S. using FREE local AI - NO API KEYS NEEDED"""
+async def jarvis_chat(
+    request: JarvisChatRequest,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Chat with J.A.R.V.I.S. AI Assistant"""
     try:
-        # Verify token
-        token = credentials.credentials
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=["HS256"])
+        user_email = current_user.get("email", "user")
         
-        user_email = payload.get("email", "user")
+        logger.info(f"J.A.R.V.I.S. chat from {user_email}: {request.message[:50]}...")
         
-        logger.info(f"JARVIS chat from {user_email}: {request.message[:50]}...")
-        
-        # Build context
+        # Build enhanced context
         user_context = {
-            "user_id": payload.get("user_id"),
+            "user_id": current_user.get("user_id"),
             "email": user_email,
-            "is_admin": payload.get("is_admin", False),
-            "current_tab": request.context.get("current_tab", "dashboard") if request.context else "dashboard"
+            "is_admin": current_user.get("is_admin", False),
+            "current_tab": request.context.get("current_tab", "dashboard") if request.context else "dashboard",
+            "clients_online": len([c for c in db.clients.values() if c.get('ws_online')]),
+            "total_clients": len(db.clients),
         }
         
-        # Process with local AI (FREE - NO API KEYS)
+        # Process with Local AI
         result = await process_with_local_ai(request.message, user_context)
         
         # Log interaction
@@ -1403,7 +1167,11 @@ async def jarvis_chat(request: JarvisChatRequest, credentials: HTTPAuthorization
             "/api/jarvis/chat",
             user_email,
             "success",
-            {"message_length": len(request.message), "has_action": result.get("action") is not None}
+            {
+                "message_length": len(request.message),
+                "has_action": result.get("action") is not None,
+                "response_length": len(result['response'])
+            }
         )
         
         return JarvisChatResponse(**result)
@@ -1413,85 +1181,63 @@ async def jarvis_chat(request: JarvisChatRequest, credentials: HTTPAuthorization
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
     except Exception as e:
-        logger.error(f"JARVIS error: {e}")
+        logger.error(f"J.A.R.V.I.S. error: {e}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"AI processing error: {str(e)}")
 
-@app.post("/api/jarvis/execute-action")
-async def jarvis_execute_action(action: Dict, credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Execute JARVIS action"""
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=["HS256"])
-        
-        user_email = payload.get("email")
-        
-        controller = JarvisWebsiteController(token=token, user=payload)
-        result = await controller.execute_action(action)
-        
-        logger.info(f"JARVIS action by {user_email}: {action.get('type')}")
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Action error: {e}")
-        return {"success": False, "error": str(e)}
-
 @app.get("/api/jarvis/system-status")
-async def jarvis_system_status(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Get JARVIS system status"""
+async def jarvis_system_status(current_user: Dict = Depends(get_current_user)):
+    """Get J.A.R.V.I.S. system status"""
     try:
-        payload = verify_jwt_token(credentials.credentials)
-        if not payload:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        
         return {
             "success": True,
             "status": {
                 "jarvis": "online",
-                "ai_model": "local_ai (FREE)",
+                "ai_model": "local_ai",
                 "personality_engine": "active",
-                "website_knowledge": "complete",
                 "conversation_history": len(personality_engine.conversation_history),
                 "local_ai_patterns": len(local_ai.patterns),
-                "requires_api_key": False,
-                "cost": "$0.00"
+                "free": True,
+                "api_key_required": False,
+                "capabilities": [
+                    "Natural language processing",
+                    "Website navigation",
+                    "Command execution",
+                    "System monitoring",
+                    "Conversational context",
+                    "Action parsing"
+                ]
             }
         }
     except Exception as e:
+        logger.error(f"Status error: {e}")
         return {"success": False, "error": str(e)}
 
 @app.post("/api/jarvis/reset-conversation")
-async def jarvis_reset_conversation(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Reset conversation history"""
+async def jarvis_reset_conversation(current_user: Dict = Depends(get_current_user)):
+    """Reset J.A.R.V.I.S. conversation history"""
     try:
-        payload = verify_jwt_token(credentials.credentials)
-        if not payload:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        
         personality_engine.conversation_history = []
-        
         return {
             "success": True,
-            "message": "Conversation history reset"
+            "message": "Conversation history reset successfully"
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 @app.get("/api/jarvis/get-suggestions")
-async def jarvis_get_suggestions(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Get contextual suggestions"""
+async def jarvis_get_suggestions(current_user: Dict = Depends(get_current_user)):
+    """Get contextual suggestions from J.A.R.V.I.S."""
     try:
-        payload = verify_jwt_token(credentials.credentials)
-        if not payload:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        
         suggestions = [
             {"text": "Show connected clients", "action": {"type": "navigate", "tab": "clients"}},
             {"text": "Take a screenshot", "action": {"type": "command", "command": "screenshot"}},
             {"text": "Open Python tab", "action": {"type": "navigate", "tab": "python"}},
             {"text": "Check system status", "action": {"type": "status", "target": "system"}},
             {"text": "Refresh dashboard", "action": {"type": "refresh", "target": "all"}},
-            {"text": "Open chat", "action": {"type": "navigate", "tab": "chat"}}
+            {"text": "Open chat", "action": {"type": "navigate", "tab": "chat"}},
+            {"text": "View system logs", "action": {"type": "navigate", "tab": "logs"}},
+            {"text": "Start recording", "action": {"type": "command", "command": "record_screen"}}
         ]
         
         return {
@@ -1503,718 +1249,149 @@ async def jarvis_get_suggestions(credentials: HTTPAuthorizationCredentials = Dep
 
 @app.get("/api/jarvis/ai-config")
 async def get_ai_config():
-    """Get AI configuration - Shows FREE local AI details"""
+    """Get AI configuration details"""
     return {
         "success": True,
         "config": {
-            "ai_provider": "local_patterns",
+            "ai_provider": "local_pattern_matching",
             "free": True,
             "patterns_loaded": len(local_ai.patterns),
             "requires_api_key": False,
             "offline_capable": True,
-            "cost_per_request": "$0.00",
             "features": [
                 "Website navigation",
                 "Command execution",
                 "System monitoring",
                 "Chat control",
-                "Data management"
+                "Data management",
+                "Context awareness",
+                "Natural language understanding"
+            ],
+            "supported_operations": [
+                "Tab navigation",
+                "Client management",
+                "Screenshot capture",
+                "Screen recording",
+                "System status checks",
+                "Log viewing",
+                "Chat messaging"
             ]
         }
     }
 
-# ========== CLIENT MANAGEMENT ENDPOINTS ==========
-@app.post("/api/create-account", response_model=dict)
-async def create_account(data: UserCreate, user: dict = Depends(authenticate_user)):
-    """Create a new user account"""
-    try:
-        # Check if user is xotiic (owner)
-        if user.get("email") != "xotiic":
-            raise HTTPException(status_code=403, detail="Only xotiic can create accounts")
-        
-        # Check if passwords match
-        if data.password != data.confirm_password:
-            raise HTTPException(status_code=400, detail="Passwords do not match")
-        
-        if len(data.password) < 6:
-            raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-        
-        # Try to create in Supabase first
-        new_user = None
-        if supabase:
-            new_user = await create_supabase_user({
-                "email": data.email,
-                "password": data.password,
-                "is_admin": data.is_admin,
-                "theme": data.theme
-            })
-        
-        # Fallback to in-memory database
-        if not new_user and not db.get_user_by_email(data.email):
-            new_user = {
-                "id": str(uuid.uuid4()),
-                "email": data.email,
-                "password": data.password,
-                "is_admin": data.is_admin,
-                "theme": data.theme,
-                "is_active": True,
-                "created_at": datetime.utcnow().isoformat(),
-                "last_login": None
-            }
-            
-            db.users[data.email.lower()] = new_user
-            logger.info(f"✅ Account created in memory for: {data.email}")
-        
-        if not new_user:
-            raise HTTPException(status_code=400, detail="User already exists")
-        
-        return {
-            "success": True,
-            "message": "Account created successfully",
-            "email": data.email,
-            "is_admin": data.is_admin,
-            "theme": data.theme
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Create account error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/users", response_model=dict)
-async def get_users(user: dict = Depends(authenticate_user)):
-    """Get all users (admin only)"""
-    try:
-        if not user.get("is_admin"):
-            raise HTTPException(status_code=403, detail="Admin access required")
-        
-        users = []
-        
-        # Get from Supabase if available
-        if supabase:
-            response = supabase.table("users")\
-                .select("id, email, is_admin, theme, is_active, last_login, created_at")\
-                .execute()
-            
-            if response.data:
-                users = response.data
-        
-        # Add in-memory users
-        for user_data in db.users.values():
-            users.append({
-                "id": user_data["id"],
-                "email": user_data["email"],
-                "is_admin": user_data.get("is_admin", False),
-                "theme": user_data.get("theme", "red_black"),
-                "is_active": user_data.get("is_active", True),
-                "created_at": user_data.get("created_at"),
-                "last_login": user_data.get("last_login")
-            })
-        
-        # Remove duplicates
-        unique_users = {}
-        for u in users:
-            if u["email"] not in unique_users:
-                unique_users[u["email"]] = u
-        
-        return {
-            "success": True,
-            "users": list(unique_users.values())
-        }
-        
-    except Exception as e:
-        logger.error(f"Get users error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.post("/api/register-client", response_model=dict)
-async def register_client(data: ClientRegister, request: Request):
-    """Register a new client"""
-    try:
-        # Get client IP from request
-        if not data.ip_address or data.ip_address == "127.0.0.1":
-            client_ip = request.headers.get('X-Forwarded-For', request.client.host)
-            if client_ip:
-                data.ip_address = client_ip.split(',')[0].strip()
-            else:
-                data.ip_address = "Unknown"
-        
-        # Check for duplicate by name
-        existing_client = None
-        for client_id, client in db.clients.items():
-            if client.get("name") == data.name:
-                existing_client = client
-                break
-        
-        if existing_client:
-            logger.info(f"⚠️  Client with name '{data.name}' already exists. Updating instead.")
-            data.client_id = existing_client.get("client_id", data.client_id)
-            action = "updated"
-        else:
-            action = "registered"
-        
-        # Update in-memory database
-        client_data = {
-            "id": str(uuid.uuid4()) if data.client_id not in db.clients else db.clients[data.client_id]["id"],
-            "client_id": data.client_id,
-            "name": data.name,
-            "ip_address": data.ip_address,
-            "os_info": data.os_info,
-            "hardware_info": data.hardware_info or {},
-            "online": True,
-            "last_seen": datetime.utcnow().isoformat(),
-            "registered_at": datetime.utcnow().isoformat() if action == "registered" else db.clients[data.client_id].get("registered_at", datetime.utcnow().isoformat())
-        }
-        
-        db.clients[data.client_id] = client_data
-        
-        # Store in Supabase if available
-        if supabase:
-            try:
-                # Check if client exists in Supabase
-                existing = supabase.table("clients")\
-                    .select("*")\
-                    .eq("client_id", data.client_id)\
-                    .execute()
-                
-                client_data_db = {
-                    "client_id": data.client_id,
-                    "name": data.name,
-                    "ip_address": data.ip_address,
-                    "os_info": data.os_info,
-                    "hardware_info": data.hardware_info or {},
-                    "online": True,
-                    "last_seen": datetime.utcnow().isoformat(),
-                    "updated_at": datetime.utcnow().isoformat()
-                }
-                
-                if existing.data and len(existing.data) > 0:
-                    # Update existing
-                    supabase.table("clients")\
-                        .update(client_data_db)\
-                        .eq("client_id", data.client_id)\
-                        .execute()
-                else:
-                    # Create new
-                    client_data_db.update({
-                        "registered_at": datetime.utcnow().isoformat(),
-                        "created_at": datetime.utcnow().isoformat()
-                    })
-                    supabase.table("clients").insert(client_data_db).execute()
-                
-            except Exception as e:
-                logger.error(f"Supabase client registration error: {e}")
-        
-        # Add log entry
-        log_entry = {
-            "id": str(uuid.uuid4()),
-            "client_id": data.client_id,
-            "log_type": "info",
-            "message": f"Client {action}: {data.name} ({data.client_id})",
-            "created_at": datetime.utcnow().isoformat()
-        }
-        
-        db.logs.append(log_entry)
-        
-        logger.info(f"Client {action}: {data.client_id}")
-        
-        return {
-            "success": True, 
-            "message": f"Client {action} successfully",
-            "client_id": data.client_id,
-            "action": action
-        }
-        
-    except Exception as e:
-        logger.error(f"Client registration error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/clients", response_model=dict)
-async def get_clients(
-    user: dict = Depends(authenticate_user),
-    online_only: bool = Query(False),
-    search: Optional[str] = Query(None)
-):
-    """Get all clients"""
-    try:
-        clients_list = []
-        
-        # Get from Supabase if available
-        if supabase:
-            query = supabase.table("clients").select("*")
-            
-            if search:
-                query = query.or_(f"name.ilike.%{search}%,client_id.ilike.%{search}%")
-            
-            response = query.order("last_seen", desc=True).execute()
-            
-            if response.data:
-                clients_list = response.data
-        else:
-            # Fallback to in-memory
-            clients_list = list(db.clients.values())
-            
-            if search:
-                search_lower = search.lower()
-                clients_list = [c for c in clients_list if 
-                              search_lower in c.get("client_id", "").lower() or
-                              search_lower in c.get("name", "").lower() or
-                              search_lower in c.get("ip_address", "").lower()]
-        
-        # Filter if needed
-        if online_only:
-            clients_list = [c for c in clients_list if c.get("online")]
-        
-        # Mark clients as online if they have active WebSocket connections
-        for client in clients_list:
-            client["ws_online"] = client.get("client_id") in manager.client_connections
-        
-        # Add streaming status
-        for client in clients_list:
-            client_id = client.get("client_id")
-            client["is_streaming"] = manager.is_streaming(client_id)
-            client["is_auto_screenshots"] = manager.is_auto_screenshots(client_id)
-            client["is_auto_recordings"] = manager.is_auto_recordings(client_id)
-        
-        # Sort by last seen
-        clients_list.sort(key=lambda x: x.get("last_seen", ""), reverse=True)
-        
-        return {
-            "success": True,
-            "clients": clients_list
-        }
-    except Exception as e:
-        logger.error(f"Get clients error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.post("/api/command", response_model=dict)
-async def send_command(data: CommandRequest, user: dict = Depends(authenticate_user)):
-    """Send command to client"""
-    try:
-        structured_logger.log_api_call("/api/command", user.get("email"), "started", {
-            "client_id": data.client_id,
-            "command": data.command
-        })
-        
-        # Check if client exists
-        client_exists = False
-        if supabase:
-            response = supabase.table("clients")\
-                .select("*")\
-                .eq("client_id", data.client_id)\
-                .execute()
-            client_exists = bool(response.data)
-        else:
-            client_exists = data.client_id in db.clients
-        
-        if not client_exists:
-            raise HTTPException(status_code=404, detail="Client not found")
-        
-        # Create command record
-        command_id = str(uuid.uuid4())
-        command_data = {
-            "id": command_id,
-            "client_id": data.client_id,
-            "command": data.command,
-            "parameters": data.parameters,
-            "status": "pending",
-            "user_email": user.get("email", "unknown"),
-            "created_at": datetime.utcnow().isoformat()
-        }
-        
-        # Store in memory
-        db.commands.append(command_data)
-        
-        # Send via WebSocket
-        sent = await manager.send_to_client(data.client_id, {
-            "type": "command",
-            "command_id": command_id,
-            "command": data.command,
-            "parameters": data.parameters,
-            "timestamp": datetime.utcnow().isoformat(),
-            "from_user": user.get("email", "unknown")
-        })
-        
-        if sent:
-            structured_logger.log_command(command_id, data.client_id, data.command, user.get("email"), "sent")
-        else:
-            structured_logger.log_command(command_id, data.client_id, data.command, user.get("email"), "queued")
-        
-        return {
-            "success": True,
-            "command_id": command_id,
-            "sent_via_websocket": sent,
-            "client_id": data.client_id,
-            "message": "Command queued for execution"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Send command error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/commands", response_model=dict)
-async def get_commands(
-    user: dict = Depends(authenticate_user),
-    client_id: Optional[str] = Query(None),
-    status: Optional[str] = Query(None),
-    limit: int = Query(50, ge=1, le=1000)
-):
-    """Get recent commands"""
-    try:
-        commands_list = db.commands.copy()
-        
-        # Apply filters
-        if client_id:
-            commands_list = [c for c in commands_list if c.get("client_id") == client_id]
-        
-        if status:
-            commands_list = [c for c in commands_list if c.get("status") == status]
-        
-        # Sort by date
-        commands_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-        commands_list = commands_list[:limit]
-        
-        return {
-            "success": True,
-            "commands": commands_list
-        }
-    except Exception as e:
-        logger.error(f"Get commands error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/logs", response_model=dict)
-async def get_logs(
-    user: dict = Depends(authenticate_user),
-    client_id: Optional[str] = Query(None),
-    log_type: Optional[str] = Query(None),
-    limit: int = Query(100, ge=1, le=1000)
-):
-    """Get system logs"""
-    try:
-        logs_list = db.logs.copy()
-        
-        # Apply filters
-        if client_id:
-            logs_list = [l for l in logs_list if l.get("client_id") == client_id]
-        
-        if log_type and log_type != "all":
-            logs_list = [l for l in logs_list if l.get("log_type") == log_type]
-        
-        # Sort by date
-        logs_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-        logs_list = logs_list[:limit]
-        
-        return {
-            "success": True,
-            "logs": logs_list
-        }
-    except Exception as e:
-        logger.error(f"Get logs error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.post("/api/screenshot", response_model=dict)
-async def upload_screenshot(data: ScreenshotRequest):
-    """Upload screenshot"""
-    try:
-        # Validate image data
-        try:
-            image_data = base64.b64decode(data.image_data)
-        except:
-            raise HTTPException(status_code=400, detail="Invalid image data")
-        
-        # Store in memory
-        screenshot_data = {
-            "client_id": data.client_id,
-            "filename": data.filename,
-            "image_data": data.image_data,
-            "size": len(image_data),
-            "created_at": datetime.utcnow().isoformat()
-        }
-        
-        db.add_screenshot(screenshot_data)
-        
-        # Notify admins
-        await manager.notify_admins({
-            "type": "screenshot_received",
-            "client_id": data.client_id,
-            "filename": data.filename,
-            "size": len(image_data),
-            "timestamp": datetime.utcnow().isoformat()
-        })
-        
-        return {
-            "success": True,
-            "message": "Screenshot uploaded",
-            "filename": data.filename,
-            "size": len(image_data)
-        }
-        
-    except Exception as e:
-        logger.error(f"Upload screenshot error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/screenshots", response_model=dict)
-async def get_screenshots(
-    user: dict = Depends(authenticate_user),
-    client_id: Optional[str] = Query(None),
-    limit: int = Query(50, ge=1, le=1000)
-):
-    """Get all screenshots"""
-    try:
-        screenshots_list = db.screenshots.copy()
-        
-        # Apply filters
-        if client_id:
-            screenshots_list = [s for s in screenshots_list if s.get("client_id") == client_id]
-        
-        # Sort by date
-        screenshots_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-        screenshots_list = screenshots_list[:limit]
-        
-        return {
-            "success": True,
-            "screenshots": screenshots_list
-        }
-    except Exception as e:
-        logger.error(f"Get screenshots error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/recordings", response_model=dict)
-async def get_recordings(
-    user: dict = Depends(authenticate_user),
-    client_id: Optional[str] = Query(None),
-    limit: int = Query(50, ge=1, le=1000)
-):
-    """Get all screen recordings"""
-    try:
-        recordings_list = db.recordings.copy()
-        
-        # Apply filters
-        if client_id:
-            recordings_list = [r for r in recordings_list if r.get("client_id") == client_id]
-        
-        # Sort by date
-        recordings_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-        recordings_list = recordings_list[:limit]
-        
-        return {
-            "success": True,
-            "recordings": recordings_list
-        }
-    except Exception as e:
-        logger.error(f"Get recordings error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/stats", response_model=dict)
-async def get_stats(user: dict = Depends(authenticate_user)):
-    """Get system statistics"""
-    try:
-        stats = {
-            "total_clients": len(db.clients),
-            "online_clients": len([c for c in db.clients.values() if c.get("online")]),
-            "ws_online_clients": len(manager.client_connections),
-            "pending_commands": len([c for c in db.commands if c.get("status") in ["pending", "running"]]),
-            "total_commands": len(db.commands),
-            "today_logs": len([l for l in db.logs if l.get("created_at", "").startswith(datetime.utcnow().date().isoformat())]),
-            "total_screenshots": len(db.screenshots),
-            "total_recordings": len(db.recordings),
-            "total_users": len(db.users),
-            "active_admins": len(manager.admin_connections),
-            "chat_users": len(manager.chat_connections),
-            "active_recordings": len(manager.active_recordings),
-            "active_streams": len(manager.active_streams),
-            "auto_screenshots": len(manager.auto_screenshots),
-            "auto_recordings": len(manager.auto_recordings)
-        }
-        
-        return {
-            "success": True,
-            "stats": stats
-        }
-    except Exception as e:
-        logger.error(f"Get stats error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.post("/api/client/heartbeat", response_model=dict)
-async def client_heartbeat(data: dict):
-    """Receive heartbeat from client"""
-    try:
-        client_id = data.get("client_id")
-        if not client_id:
-            return {"success": False, "error": "Client ID required"}
-        
-        # Update heartbeat timestamp
-        db.update_client_heartbeat(client_id)
-        
-        # Update client last_seen
-        if client_id in db.clients:
-            db.clients[client_id]["last_seen"] = datetime.utcnow().isoformat()
-            db.clients[client_id]["online"] = True
-        
-        # Check if client has pending messages
-        if client_id in manager.pending_messages and manager.pending_messages[client_id]:
-            return {
-                "success": True,
-                "has_pending_messages": True,
-                "message_count": len(manager.pending_messages[client_id])
-            }
-        
-        return {"success": True, "has_pending_messages": False}
-        
-    except Exception as e:
-        logger.error(f"Heartbeat error: {e}")
-        return {"success": False, "error": str(e)}
-
 # ========== WEBSOCKET ENDPOINTS ==========
+
 @app.websocket("/ws/admin")
 async def websocket_admin(websocket: WebSocket):
-    """WebSocket endpoint for admin dashboard"""
+    """Admin WebSocket connection"""
+    await manager.connect(websocket, "admin", "admin")
     try:
-        await manager.connect_admin(websocket)
-        
-        # Send initial status
-        await websocket.send_json({
-            "type": "status",
-            "message": "Connected to admin dashboard",
-            "active_clients": len(manager.client_connections),
-            "timestamp": datetime.utcnow().isoformat()
-        })
-        
         while True:
-            try:
-                data = await websocket.receive_json()
-                
-                if data.get("type") == "ping":
-                    await websocket.send_json({
-                        "type": "pong",
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-                    
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                logger.error(f"Error receiving WebSocket message: {e}")
-                continue
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            # Handle different message types
+            if message.get("type") == "ping":
+                await websocket.send_text(json.dumps({
+                    "type": "pong",
+                    "timestamp": datetime.utcnow().isoformat()
+                }))
             
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect("admin", "admin")
     except Exception as e:
         logger.error(f"Admin WebSocket error: {e}")
-        manager.disconnect(websocket)
+        manager.disconnect("admin", "admin")
 
 @app.websocket("/ws/client/{client_id}")
 async def websocket_client(websocket: WebSocket, client_id: str):
-    """WebSocket endpoint for client connections"""
+    """Client WebSocket connection"""
+    await manager.connect(websocket, client_id, "client")
+    
+    # Notify admins of new connection
+    await manager.broadcast(json.dumps({
+        "type": "client_connected",
+        "client_id": client_id,
+        "timestamp": datetime.utcnow().isoformat()
+    }))
+    
     try:
-        await manager.connect_client(websocket, client_id)
-        
-        # Send welcome message
-        await websocket.send_json({
-            "type": "welcome",
-            "message": f"Connected to server as {client_id}",
-            "server_time": datetime.utcnow().isoformat(),
-            "client_id": client_id
-        })
-        
         while True:
-            try:
-                data = await websocket.receive_json()
-                message_type = data.get("type")
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            # Handle client messages
+            if message.get("type") == "heartbeat":
+                await websocket.send_text(json.dumps({
+                    "type": "heartbeat_ack",
+                    "timestamp": datetime.utcnow().isoformat()
+                }))
                 
-                if message_type == "heartbeat":
-                    db.update_client_heartbeat(client_id)
-                    await websocket.send_json({
-                        "type": "heartbeat_response",
-                        "timestamp": datetime.utcnow().isoformat()
+                # Update last seen
+                client = db.get_client(client_id)
+                if client:
+                    client['last_seen'] = datetime.utcnow().isoformat()
+            
+            elif message.get("type") == "command_result":
+                # Update command status
+                command_id = message.get("command_id")
+                if command_id:
+                    db.update_command(command_id, {
+                        "status": "completed",
+                        "result": message.get("result"),
+                        "error": message.get("error"),
+                        "completed_at": datetime.utcnow().isoformat()
                     })
                 
-                elif message_type == "command_result":
-                    command_id = data.get("command_id")
-                    for cmd in db.commands:
-                        if cmd["id"] == command_id:
-                            cmd["status"] = "completed"
-                            cmd["result"] = data.get("result")
-                            cmd["completed_at"] = datetime.utcnow().isoformat()
-                            break
-                    
-                    await manager.notify_admins({
-                        "type": "command_result",
-                        "client_id": client_id,
-                        "command_id": command_id,
-                        "result": data.get("result"),
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
+                # Notify admins
+                await manager.broadcast(json.dumps({
+                    "type": "command_result",
+                    "client_id": client_id,
+                    "command_id": command_id,
+                    "result": message.get("result"),
+                    "error": message.get("error")
+                }))
+            
+            elif message.get("type") == "screenshot":
+                # Save screenshot
+                screenshot_data = {
+                    "client_id": client_id,
+                    "filename": message.get("filename"),
+                    "image_data": message.get("image_data"),
+                    "size": len(message.get("image_data", "")),
+                    "width": message.get("width"),
+                    "height": message.get("height")
+                }
+                db.add_screenshot(screenshot_data)
                 
-                elif message_type == "screenshot_result":
-                    image_data = data.get("image_data")
-                    filename = data.get("filename", f"screenshot_{client_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png")
-                    
-                    if image_data:
-                        screenshot_data = {
-                            "client_id": client_id,
-                            "filename": filename,
-                            "image_data": image_data,
-                            "size": len(base64.b64decode(image_data)),
-                            "created_at": datetime.utcnow().isoformat()
-                        }
-                        
-                        db.add_screenshot(screenshot_data)
-                        
-                        await manager.notify_admins({
-                            "type": "screenshot_received",
-                            "client_id": client_id,
-                            "filename": filename,
-                            "timestamp": datetime.utcnow().isoformat()
-                        })
-                
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                logger.error(f"Error processing message from {client_id}: {e}")
-                continue
-                
+                # Notify admins
+                await manager.broadcast(json.dumps({
+                    "type": "screenshot_received",
+                    "client_id": client_id,
+                    "filename": message.get("filename")
+                }))
+            
     except WebSocketDisconnect:
-        pass
+        manager.disconnect(client_id, "client")
+        
+        # Notify admins of disconnection
+        await manager.broadcast(json.dumps({
+            "type": "client_disconnected",
+            "client_id": client_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }))
     except Exception as e:
         logger.error(f"Client WebSocket error: {e}")
-    finally:
-        manager.disconnect(websocket)
+        manager.disconnect(client_id, "client")
 
-@app.websocket("/ws/chat/{user_id}")
-async def websocket_chat(websocket: WebSocket, user_id: str):
-    """WebSocket endpoint for chat"""
-    try:
-        await manager.connect_chat(websocket, user_id)
-        
-        while True:
-            try:
-                data = await websocket.receive_json()
-                data_type = data.get("type")
-                
-                if data_type == "ping":
-                    await websocket.send_json({
-                        "type": "pong",
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-                    
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                logger.error(f"Chat WebSocket error: {e}")
-                continue
-                
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception as e:
-        logger.error(f"Chat WebSocket error: {e}")
-        manager.disconnect(websocket)
+# ========== STARTUP & SHUTDOWN ==========
+
 def print_startup_banner():
+    """Print ASCII art banner on startup"""
     banner = """
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
-║     ░J░A░R░V░I░S░  ANALCONTROL v4.0  -  UNIFIED BACKEND     ║
+║     ░J░A░R░V░I░S░  Backend v4.0  -  ANALCONTROL             ║
 ║                                                              ║
 ║        Just A Rather Very Intelligent System                 ║
 ║                                                              ║
@@ -2222,59 +1399,812 @@ def print_startup_banner():
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 
-🤖 J.A.R.V.I.S. initializing with FREE local AI...
+🤖 J.A.R.V.I.S. AI Systems Initializing...
     """
     print(banner)
     
-    print("\n📋 Configuration:")
-    print(f"   • AI Provider: Local Pattern Matching (FREE)")
-    print(f"   • Patterns Loaded: {len(local_ai.patterns)}")
-    print(f"   • Personality Engine: ✅ Active")
-    print(f"   • Website Knowledge: ✅ Complete")
+    print("\n📋 System Configuration:")
+    print(f"   • Port: {PORT}")
+    print(f"   • AI Provider: Local Pattern Matching")
+    print(f"   • AI Patterns: {len(local_ai.patterns)} loaded")
     print(f"   • API Key Required: ❌ NO - 100% Free")
-    print(f"   • Internet Required: ❌ NO - Works offline")
-    print(f"   • Cost Per Request: $0.00")
+    print(f"   • Internet Required: ❌ NO - Works Offline")
+    print(f"   • JWT Secret: {JWT_SECRET_KEY[:20]}...")
     
-    print("\n🏗️  Capabilities:")
-    print("   1. Complete website navigation (7 tabs)")
-    print("   2. Command execution on clients")
-    print("   3. Screenshot and recording control")
-    print("   4. System monitoring and status")
-    print("   5. Chat and communication")
+    print("\n🏗️  Core Capabilities:")
+    print("   1. Complete website control (7 tabs)")
+    print("   2. Client monitoring and management")
+    print("   3. Remote command execution")
+    print("   4. Screenshot and recording capture")
+    print("   5. Live screen streaming")
     print("   6. Python script execution")
-    print("   7. Data management and refresh")
+    print("   7. Real-time chat system")
+    print("   8. Comprehensive logging")
+    print("   9. WebSocket real-time updates")
+    print("  10. J.A.R.V.I.S. AI assistant")
     
     print("\n🌐 API Endpoints:")
-    print("   • POST   /api/jarvis/chat              - Chat with JARVIS (FREE AI)")
-    print("   • GET    /api/jarvis/ai-config         - Show AI configuration")
-    print("   • POST   /api/jarvis/execute-action    - Execute website actions")
-    print("   • GET    /api/jarvis/system-status     - Get system status")
     print("   • POST   /api/login                    - User authentication")
-    print("   • GET    /api/clients                  - Get all clients")
-    print("   • POST   /api/command                  - Send commands")
+    print("   • POST   /api/jarvis/chat              - Chat with J.A.R.V.I.S. (FREE AI)")
+    print("   • GET    /api/jarvis/ai-config         - AI configuration")
+    print("   • GET    /api/jarvis/system-status     - J.A.R.V.I.S. status")
+    print("   • GET    /api/stats                    - System statistics")
+    print("   • GET    /api/clients                  - Client list")
+    print("   • POST   /api/command                  - Execute command")
+    print("   • WS     /ws/admin                     - Admin WebSocket")
+    print("   • WS     /ws/client/{id}               - Client WebSocket")
     
-    print("\n🚀 Try these commands:")
+    print("\n🚀 Sample Commands for J.A.R.V.I.S.:")
     print("   • 'Show me connected clients'")
-    print("   • 'Take a screenshot'")
+    print("   • 'Take screenshot from all clients'")
     print("   • 'Open Python tab'")
     print("   • 'Check system status'")
     print("   • 'What can you do?'")
+    print("   • 'Start recording'")
     
-    print("\n✅ System ready! No API keys needed - 100% FREE AI!")
-    print("   Total AI Patterns: " + str(len(local_ai.patterns)))
+    print("\n✅ System Ready!")
+    print(f"   Backend URL: {BACKEND_URL}")
+    print(f"   API Docs: {BACKEND_URL}/api/docs")
+    print(f"   Total AI Patterns: {len(local_ai.patterns)}")
     print("   Memory Usage: Minimal")
-    print("   Cost: $0.00\n")
+    print("   Cost: $0.00 (100% FREE)\n")
+    
+    logger.info("ANALCONTROL Backend v4.0 started successfully")
+    logger.info(f"J.A.R.V.I.S. AI initialized with {len(local_ai.patterns)} response patterns")
 
 @app.on_event("startup")
 async def startup_event():
+    """Execute on application startup"""
     print_startup_banner()
+    
+    # Initialize default data
+    logger.info("Initializing default system data...")
+    
+    # Add sample log
+    db.add_log({
+        "client_id": "system",
+        "log_type": "info",
+        "message": "ANALCONTROL system started successfully"
+    })
 
-# ========== MAIN ==========
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Execute on application shutdown"""
+    logger.info("ANALCONTROL Backend shutting down...")
+    
+    # Close all WebSocket connections
+    for conn_id in list(manager.active_connections.keys()):
+        try:
+            await manager.active_connections[conn_id].close()
+        except:
+            pass
+    
+    for client_id in list(manager.client_connections.keys()):
+        try:
+            await manager.client_connections[client_id].close()
+        except:
+            pass
+    
+    logger.info("All WebSocket connections closed")
+    logger.info("Shutdown complete")
+
+# ========== MAIN EXECUTION ==========
 if __name__ == "__main__":
     import uvicorn
+    
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=PORT,
-        log_level="info"
+        log_level="info",
+        access_log=True
     )
+
+# ========== ADDITIONAL FEATURES ==========
+
+# File Management Endpoints
+@app.post("/api/upload/screenshot")
+async def upload_screenshot(
+    file: UploadFile = File(...),
+    client_id: str = Form(...),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Upload screenshot file"""
+    try:
+        # Read file content
+        content = await file.read()
+        
+        # Generate filename
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"screenshot_{client_id}_{timestamp}.png"
+        filepath = SCREENSHOTS_DIR / filename
+        
+        # Save file
+        with open(filepath, "wb") as f:
+            f.write(content)
+        
+        # Add to database
+        screenshot_data = {
+            "client_id": client_id,
+            "filename": filename,
+            "filepath": str(filepath),
+            "size": len(content),
+            "image_data": base64.b64encode(content).decode('utf-8')
+        }
+        db.add_screenshot(screenshot_data)
+        
+        return {"success": True, "screenshot": screenshot_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/screenshot/{screenshot_id}/download")
+async def download_screenshot(
+    screenshot_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Download screenshot"""
+    screenshot = next((s for s in db.screenshots if s['id'] == screenshot_id), None)
+    if not screenshot:
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+    
+    if 'filepath' in screenshot and Path(screenshot['filepath']).exists():
+        return FileResponse(screenshot['filepath'])
+    elif 'image_data' in screenshot:
+        # Return base64 data as image
+        image_bytes = base64.b64decode(screenshot['image_data'])
+        return StreamingResponse(io.BytesIO(image_bytes), media_type="image/png")
+    else:
+        raise HTTPException(status_code=404, detail="Screenshot data not available")
+
+@app.delete("/api/screenshot/{screenshot_id}")
+async def delete_screenshot(
+    screenshot_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Delete screenshot"""
+    screenshot = next((s for s in db.screenshots if s['id'] == screenshot_id), None)
+    if not screenshot:
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+    
+    # Remove from database
+    db.screenshots = [s for s in db.screenshots if s['id'] != screenshot_id]
+    
+    # Delete file if exists
+    if 'filepath' in screenshot and Path(screenshot['filepath']).exists():
+        Path(screenshot['filepath']).unlink()
+    
+    return {"success": True, "message": "Screenshot deleted"}
+
+# Recording Management
+@app.post("/api/recording/start")
+async def start_recording(
+    client_id: str = Form(...),
+    duration: int = Form(30),
+    fps: int = Form(30),
+    quality: str = Form("medium"),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Start screen recording on client"""
+    command_data = {
+        "client_id": client_id,
+        "command": "record_screen",
+        "parameters": {
+            "duration": duration,
+            "fps": fps,
+            "quality": quality
+        },
+        "user_id": current_user['user_id'],
+        "user_email": current_user['email']
+    }
+    
+    saved_command = db.add_command(command_data)
+    
+    # Send via WebSocket if online
+    if client_id in manager.client_connections:
+        await manager.send_personal_message(
+            json.dumps({
+                "type": "command",
+                "command_id": saved_command['id'],
+                "command": "record_screen",
+                "parameters": command_data['parameters']
+            }),
+            client_id
+        )
+    
+    return {"success": True, "command_id": saved_command['id']}
+
+@app.post("/api/recording/stop")
+async def stop_recording(
+    client_id: str = Form(...),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Stop screen recording on client"""
+    command_data = {
+        "client_id": client_id,
+        "command": "stop_recording",
+        "parameters": {},
+        "user_id": current_user['user_id'],
+        "user_email": current_user['email']
+    }
+    
+    saved_command = db.add_command(command_data)
+    
+    if client_id in manager.client_connections:
+        await manager.send_personal_message(
+            json.dumps({
+                "type": "command",
+                "command_id": saved_command['id'],
+                "command": "stop_recording",
+                "parameters": {}
+            }),
+            client_id
+        )
+    
+    return {"success": True, "command_id": saved_command['id']}
+
+@app.delete("/api/recording/{recording_id}")
+async def delete_recording(
+    recording_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Delete recording"""
+    recording = next((r for r in db.recordings if r['id'] == recording_id), None)
+    if not recording:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    
+    # Remove from database
+    db.recordings = [r for r in db.recordings if r['id'] != recording_id]
+    
+    # Delete file if exists
+    if 'filepath' in recording and Path(recording['filepath']).exists():
+        Path(recording['filepath']).unlink()
+    
+    return {"success": True, "message": "Recording deleted"}
+
+# Python Script Execution
+@app.post("/api/execute-python")
+async def execute_python(
+    request: PythonExecutionRequest,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Execute Python script on client"""
+    command_data = {
+        "client_id": request.client_id,
+        "command": "execute_python",
+        "parameters": {
+            "filename": request.filename,
+            "content": request.content,
+            "args": request.parameters,
+            "timeout": request.timeout
+        },
+        "user_id": current_user['user_id'],
+        "user_email": current_user['email']
+    }
+    
+    saved_command = db.add_command(command_data)
+    
+    # Save script to database
+    db.python_executions.append({
+        "id": saved_command['id'],
+        "client_id": request.client_id,
+        "filename": request.filename,
+        "content": request.content,
+        "status": "pending",
+        "created_at": datetime.utcnow().isoformat()
+    })
+    
+    # Send via WebSocket
+    if request.client_id in manager.client_connections:
+        await manager.send_personal_message(
+            json.dumps({
+                "type": "command",
+                "command_id": saved_command['id'],
+                "command": "execute_python",
+                "parameters": command_data['parameters']
+            }),
+            request.client_id
+        )
+    
+    return {
+        "success": True,
+        "command_id": saved_command['id'],
+        "sent_via_websocket": request.client_id in manager.client_connections
+    }
+
+@app.get("/api/python-execution/{command_id}")
+async def get_python_execution(
+    command_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get Python execution result"""
+    command = next((c for c in db.commands if c['id'] == command_id), None)
+    if not command:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    
+    return {"success": True, "command": command}
+
+@app.get("/api/python-executions")
+async def get_python_executions(
+    limit: int = Query(50, ge=1, le=1000),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get Python execution history"""
+    executions = [c for c in db.commands if c.get('command') == 'execute_python']
+    executions = executions[-limit:]
+    executions.reverse()
+    return {"success": True, "executions": executions}
+
+# Chat System
+@app.post("/api/chat/send")
+async def send_chat_message(
+    message: ChatMessage,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Send chat message"""
+    message_data = {
+        "sender": current_user['email'],
+        "recipient": message.recipient,
+        "message": message.message
+    }
+    
+    saved_message = db.add_chat_message(message_data)
+    
+    # Broadcast to relevant users
+    await manager.broadcast(json.dumps({
+        "type": "new_message",
+        "message": saved_message,
+        "sender_tag": {
+            "role": "admin" if current_user.get('is_admin') else "user",
+            "color": "#ff2a2a"
+        }
+    }))
+    
+    return {"success": True, "message": saved_message}
+
+@app.get("/api/chat/messages")
+async def get_chat_messages(
+    recipient: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=500),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get chat messages"""
+    messages = db.chat_messages
+    
+    if recipient and recipient != "all":
+        # Filter for private conversation
+        messages = [
+            m for m in messages
+            if (m['sender'] == current_user['email'] and m.get('recipient') == recipient) or
+               (m.get('recipient') == current_user['email'] and m['sender'] == recipient)
+        ]
+    elif recipient == "all":
+        # Global messages
+        messages = [m for m in messages if m.get('recipient') is None or m.get('recipient') == "all"]
+    
+    messages = messages[-limit:]
+    return {"success": True, "messages": messages}
+
+@app.get("/api/chat/users")
+async def get_chat_users(current_user: Dict = Depends(get_current_user)):
+    """Get all chat users"""
+    users = [
+        {
+            "user_id": user['email'],
+            "username": user['email'],
+            "role": "admin" if user['is_admin'] else "user",
+            "online": user['email'] in manager.active_connections,
+            "color": "#ff2a2a"
+        }
+        for user in db.users.values()
+    ]
+    return {"success": True, "users": users}
+
+# Bulk Operations
+@app.post("/api/screenshot/all")
+async def screenshot_all_clients(current_user: Dict = Depends(get_current_user)):
+    """Capture screenshots from all online clients"""
+    online_clients = [c for c in db.clients.values() if c.get('ws_online')]
+    
+    count = 0
+    for client in online_clients:
+        try:
+            command_data = {
+                "client_id": client['client_id'],
+                "command": "screenshot",
+                "parameters": {},
+                "user_id": current_user['user_id'],
+                "user_email": current_user['email']
+            }
+            
+            saved_command = db.add_command(command_data)
+            
+            if client['client_id'] in manager.client_connections:
+                await manager.send_personal_message(
+                    json.dumps({
+                        "type": "command",
+                        "command_id": saved_command['id'],
+                        "command": "screenshot",
+                        "parameters": {}
+                    }),
+                    client['client_id']
+                )
+                count += 1
+        except Exception as e:
+            logger.error(f"Error sending screenshot command to {client['client_id']}: {e}")
+    
+    return {"success": True, "count": count, "message": f"Screenshot command sent to {count} clients"}
+
+@app.post("/api/start-auto-screenshots")
+async def start_auto_screenshots(
+    client_id: str = Form(...),
+    interval: int = Form(5),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Start auto screenshot capture"""
+    command_data = {
+        "client_id": client_id,
+        "command": "auto_screenshot",
+        "parameters": {"interval": interval},
+        "user_id": current_user['user_id'],
+        "user_email": current_user['email']
+    }
+    
+    saved_command = db.add_command(command_data)
+    
+    if client_id in manager.client_connections:
+        await manager.send_personal_message(
+            json.dumps({
+                "type": "command",
+                "command_id": saved_command['id'],
+                "command": "auto_screenshot",
+                "parameters": {"interval": interval}
+            }),
+            client_id
+        )
+    
+    return {"success": True, "command_id": saved_command['id']}
+
+@app.post("/api/stop-auto-screenshots")
+async def stop_auto_screenshots(
+    client_id: str = Form(...),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Stop auto screenshot capture"""
+    command_data = {
+        "client_id": client_id,
+        "command": "stop_auto_screenshot",
+        "parameters": {},
+        "user_id": current_user['user_id'],
+        "user_email": current_user['email']
+    }
+    
+    saved_command = db.add_command(command_data)
+    
+    if client_id in manager.client_connections:
+        await manager.send_personal_message(
+            json.dumps({
+                "type": "command",
+                "command_id": saved_command['id'],
+                "command": "stop_auto_screenshot",
+                "parameters": {}
+            }),
+            client_id
+        )
+    
+    return {"success": True, "command_id": saved_command['id']}
+
+@app.post("/api/start-screen-stream")
+async def start_screen_stream(
+    client_id: str = Form(...),
+    fps: int = Form(10),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Start live screen streaming"""
+    command_data = {
+        "client_id": client_id,
+        "command": "live_screen",
+        "parameters": {"fps": fps},
+        "user_id": current_user['user_id'],
+        "user_email": current_user['email']
+    }
+    
+    saved_command = db.add_command(command_data)
+    
+    if client_id in manager.client_connections:
+        await manager.send_personal_message(
+            json.dumps({
+                "type": "command",
+                "command_id": saved_command['id'],
+                "command": "live_screen",
+                "parameters": {"fps": fps}
+            }),
+            client_id
+        )
+    
+    return {"success": True, "command_id": saved_command['id']}
+
+@app.post("/api/stop-screen-stream")
+async def stop_screen_stream(
+    client_id: str = Form(...),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Stop live screen streaming"""
+    command_data = {
+        "client_id": client_id,
+        "command": "stop_live_screen",
+        "parameters": {},
+        "user_id": current_user['user_id'],
+        "user_email": current_user['email']
+    }
+    
+    saved_command = db.add_command(command_data)
+    
+    if client_id in manager.client_connections:
+        await manager.send_personal_message(
+            json.dumps({
+                "type": "command",
+                "command_id": saved_command['id'],
+                "command": "stop_live_screen",
+                "parameters": {}
+            }),
+            client_id
+        )
+    
+    return {"success": True, "command_id": saved_command['id']}
+
+# Analytics and Reports
+@app.get("/api/analytics/overview")
+async def get_analytics_overview(current_user: Dict = Depends(get_current_user)):
+    """Get comprehensive analytics overview"""
+    now = datetime.utcnow()
+    
+    # Calculate time ranges
+    hour_ago = now - timedelta(hours=1)
+    day_ago = now - timedelta(days=1)
+    week_ago = now - timedelta(days=7)
+    
+    # Client analytics
+    total_clients = len(db.clients)
+    online_clients = sum(1 for c in db.clients.values() if c.get('ws_online'))
+    
+    # Command analytics
+    recent_commands = [c for c in db.commands if datetime.fromisoformat(c['created_at']) >= day_ago]
+    commands_today = len(recent_commands)
+    successful_commands = sum(1 for c in recent_commands if c.get('status') == 'completed')
+    failed_commands = sum(1 for c in recent_commands if c.get('status') == 'failed')
+    
+    # Screenshot analytics
+    screenshots_today = sum(1 for s in db.screenshots if datetime.fromisoformat(s['created_at']) >= day_ago)
+    screenshots_week = sum(1 for s in db.screenshots if datetime.fromisoformat(s['created_at']) >= week_ago)
+    
+    # Recording analytics
+    recordings_today = sum(1 for r in db.recordings if datetime.fromisoformat(r['created_at']) >= day_ago)
+    
+    # Log analytics
+    logs_hour = sum(1 for l in db.logs if datetime.fromisoformat(l['created_at']) >= hour_ago)
+    error_logs = sum(1 for l in db.logs if l.get('log_type') == 'error')
+    
+    return {
+        "success": True,
+        "analytics": {
+            "clients": {
+                "total": total_clients,
+                "online": online_clients,
+                "offline": total_clients - online_clients,
+                "online_percentage": round((online_clients / total_clients * 100) if total_clients > 0 else 0, 2)
+            },
+            "commands": {
+                "today": commands_today,
+                "successful": successful_commands,
+                "failed": failed_commands,
+                "success_rate": round((successful_commands / commands_today * 100) if commands_today > 0 else 0, 2)
+            },
+            "screenshots": {
+                "today": screenshots_today,
+                "this_week": screenshots_week,
+                "total": len(db.screenshots)
+            },
+            "recordings": {
+                "today": recordings_today,
+                "total": len(db.recordings)
+            },
+            "logs": {
+                "last_hour": logs_hour,
+                "errors": error_logs,
+                "total": len(db.logs)
+            },
+            "system": {
+                "uptime": "N/A",  # Would track from startup
+                "websocket_connections": len(manager.active_connections) + len(manager.client_connections),
+                "active_admins": len(manager.active_connections),
+                "active_clients": len(manager.client_connections)
+            }
+        },
+        "timestamp": now.isoformat()
+    }
+
+@app.get("/api/analytics/client/{client_id}")
+async def get_client_analytics(
+    client_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get analytics for specific client"""
+    client = db.get_client(client_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    
+    # Client-specific data
+    client_commands = [c for c in db.commands if c['client_id'] == client_id]
+    client_screenshots = [s for s in db.screenshots if s['client_id'] == client_id]
+    client_recordings = [r for r in db.recordings if r['client_id'] == client_id]
+    client_logs = [l for l in db.logs if l['client_id'] == client_id]
+    
+    return {
+        "success": True,
+        "client_id": client_id,
+        "analytics": {
+            "total_commands": len(client_commands),
+            "total_screenshots": len(client_screenshots),
+            "total_recordings": len(client_recordings),
+            "total_logs": len(client_logs),
+            "is_online": client.get('ws_online', False),
+            "last_seen": client.get('last_seen'),
+            "created_at": client.get('created_at')
+        }
+    }
+
+# System Maintenance
+@app.post("/api/maintenance/clear-old-data")
+async def clear_old_data(
+    days: int = Query(30, ge=1, le=365),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Clear data older than specified days"""
+    if not current_user.get('is_admin'):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    cutoff_date = datetime.utcnow() - timedelta(days=days)
+    
+    # Clear old screenshots
+    original_screenshots = len(db.screenshots)
+    db.screenshots = [s for s in db.screenshots if datetime.fromisoformat(s['created_at']) >= cutoff_date]
+    screenshots_removed = original_screenshots - len(db.screenshots)
+    
+    # Clear old recordings
+    original_recordings = len(db.recordings)
+    db.recordings = [r for r in db.recordings if datetime.fromisoformat(r['created_at']) >= cutoff_date]
+    recordings_removed = original_recordings - len(db.recordings)
+    
+    # Clear old logs
+    original_logs = len(db.logs)
+    db.logs = [l for l in db.logs if datetime.fromisoformat(l['created_at']) >= cutoff_date]
+    logs_removed = original_logs - len(db.logs)
+    
+    # Clear old commands
+    original_commands = len(db.commands)
+    db.commands = [c for c in db.commands if datetime.fromisoformat(c['created_at']) >= cutoff_date]
+    commands_removed = original_commands - len(db.commands)
+    
+    return {
+        "success": True,
+        "removed": {
+            "screenshots": screenshots_removed,
+            "recordings": recordings_removed,
+            "logs": logs_removed,
+            "commands": commands_removed
+        },
+        "cutoff_date": cutoff_date.isoformat()
+    }
+
+@app.get("/api/system/info")
+async def get_system_info():
+    """Get detailed system information"""
+    return {
+        "success": True,
+        "system": {
+            "version": "4.0.0",
+            "python_version": sys.version,
+            "platform": sys.platform,
+            "ai_engine": "Local Pattern Matching",
+            "ai_patterns": len(local_ai.patterns),
+            "database_size": {
+                "users": len(db.users),
+                "clients": len(db.clients),
+                "commands": len(db.commands),
+                "screenshots": len(db.screenshots),
+                "recordings": len(db.recordings),
+                "logs": len(db.logs),
+                "chat_messages": len(db.chat_messages)
+            },
+            "features": [
+                "Real-time monitoring",
+                "Command execution",
+                "Screenshot capture",
+                "Screen recording",
+                "Live streaming",
+                "Python execution",
+                "Chat system",
+                "J.A.R.V.I.S. AI",
+                "WebSocket communication",
+                "Analytics & Reports"
+            ]
+        }
+    }
+
+# Error Handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Custom HTTP exception handler"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """General exception handler"""
+    logger.error(f"Unhandled exception: {exc}")
+    logger.error(traceback.format_exc())
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": "Internal server error",
+            "message": str(exc),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+
+# Additional utility endpoints
+@app.get("/api/export/logs")
+async def export_logs_csv(current_user: Dict = Depends(get_current_user)):
+    """Export logs as CSV"""
+    import csv
+    from io import StringIO
+    
+    output = StringIO()
+    writer = csv.writer(output)
+    
+    # Write header
+    writer.writerow(['Timestamp', 'Client ID', 'Type', 'Message'])
+    
+    # Write data
+    for log in db.logs:
+        writer.writerow([
+            log.get('created_at'),
+            log.get('client_id'),
+            log.get('log_type'),
+            log.get('message')
+        ])
+    
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=analcontrol_logs.csv"}
+    )
+
+@app.get("/api/version")
+async def get_version():
+    """Get API version information"""
+    return {
+        "version": "4.0.0",
+        "name": "ANALCONTROL API",
+        "ai_version": "J.A.R.V.I.S. v4.0",
+        "features": {
+            "jarvis_ai": True,
+            "local_ai": True,
+            "websocket": True,
+            "file_management": True,
+            "analytics": True,
+            "bulk_operations": True
+        },
+        "endpoints_count": len([route for route in app.routes]),
+        "timestamp": datetime.utcnow().isoformat()
+    }
