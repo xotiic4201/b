@@ -3,7 +3,7 @@ services:
   - type: web
     name: worm-c2
     runtime: python
-    repo: https://github.com/yourusername/worm-c2  # Replace with your repo
+    repo: https://github.com/xotiic4201/b  # Replace with your repo
     plan: free
     region: oregon
     branch: main
