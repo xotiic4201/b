@@ -14,6 +14,7 @@ import json
 import base64
 import hashlib
 import time
+import queue
 import threading
 from pathlib import Path
 
@@ -1137,4 +1138,5 @@ async def startup_event():
     print(f"🧬 Worm Engine: {'ACTIVE' if worm_engine.running else 'INACTIVE'}")
     print(f"🔄 Auto-Propagation: {'ENABLED' if propagation_rules['default']['enabled'] else 'DISABLED'}")
     print("="*70 + "\n")
+
 
