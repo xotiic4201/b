@@ -1,10 +1,10 @@
-# Core Framework - Use versions without Rust dependencies
+# Core Framework
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 
-# Pydantic - Use older version that doesn't require Rust compilation
-pydantic==1.10.13
+# Use Pydantic v2 (required by pydantic-settings)
+pydantic==2.10.6
 pydantic-settings==2.0.3
 
 # Utilities
@@ -34,8 +34,3 @@ websockets==12.0
 
 # Monitoring
 prometheus-client==0.19.0
-
-# No zstandard - remove if not essential
-
-
-
