@@ -1,0 +1,22 @@
+# render.yaml
+services:
+  - type: web
+    name: worm-c2
+    runtime: python
+    repo: https://github.com/yourusername/worm-c2  # Replace with your repo
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: C2_USERNAME
+        value: xotiic
+      - key: C2_PASSWORD
+        value: 40671Mps19*
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: ENVIRONMENT
+        value: production
+    autoDeploy: true
