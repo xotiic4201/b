@@ -1,17 +1,15 @@
-# render.yaml
 services:
   - type: web
     name: worm-c2
     runtime: python
-    repo: https://github.com/xotiic4201/b  # Replace with your repo
-    plan: free
     region: oregon
-    branch: main
-    buildCommand: pip install -r requirements.txt
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /api/health
-    runtimeVersion: 3.11.9
     envVars:
-    - key: PYTHON_VERSION
-      value: 3.11.0  # Specify Python version
-    autoDeploy: true
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: ENVIRONMENT
+        value: production
