@@ -20,8 +20,8 @@ from pathlib import Path
 
 # ==================== RENDER CONFIGURATION ====================
 # Environment variables (set in Render dashboard)
-USERNAME = os.getenv("C2_USERNAME", "xotiic")
-PASSWORD = os.getenv("C2_PASSWORD", "40671Mps19*")
+USERNAME = os.getenv("C2_USERNAME")
+PASSWORD = os.getenv("C2_PASSWORD")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 PORT = int(os.getenv("PORT", 5000))
 
@@ -702,3 +702,4 @@ async def startup_event():
     print(f"🔑 Password: {PASSWORD}")
     print(f"📊 Total Bots: {len(bots)}")
     print("="*60 + "\n")
+
