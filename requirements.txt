@@ -12,22 +12,15 @@ aiofiles==23.2.1
 
 # Network/SSH
 paramiko==3.3.1
-scapy==2.5.0
-netifaces==0.11.0
 
 # System/Process
 psutil==5.9.6
 
-# Image Processing (Updated for Python 3.11/3.12)
-pillow==10.4.0  # Updated to support Python 3.12
-
-# Input Monitoring (Linux compatible version)
-pynput==1.7.6
-evdev==1.6.1  # For Linux input handling
+# Image Processing
+pillow==10.4.0
 
 # Cryptography
 cryptography==41.0.7
-pycryptodome==3.19.0
 
 # Database (Optional)
 sqlalchemy==2.0.23
@@ -42,3 +35,4 @@ prometheus-client==0.19.0
 
 # Compression
 zstandard==0.22.0
+
