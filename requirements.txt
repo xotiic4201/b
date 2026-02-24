@@ -1,23 +1,44 @@
+# Core Framework
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
-httpx==0.25.2
-cryptography==41.0.7
-pycryptodome==3.19.1
-bcrypt==4.0.1
-passlib==1.7.4
-python-jose==3.3.0
-sqlalchemy==2.0.23
-alembic==1.12.1
-psycopg2-binary==2.9.9
-redis==5.0.1
-pydantic==2.5.0
-pydantic-settings==2.1.0
+pydantic==2.4.2
+pydantic-settings==2.0.3
+
+# Utilities
 python-dotenv==1.0.0
 jinja2==3.1.2
+aiofiles==23.2.1
+
+# Network/SSH
 paramiko==3.3.1
 scapy==2.5.0
 netifaces==0.11.0
-pynput==1.7.6
+
+# System/Process
 psutil==5.9.6
-pillow==10.0.1  # Downgraded from 10.1.0
+
+# Image Processing (Updated for Python 3.11/3.12)
+pillow==10.4.0  # Updated to support Python 3.12
+
+# Input Monitoring (Linux compatible version)
+pynput==1.7.6
+evdev==1.6.1  # For Linux input handling
+
+# Cryptography
+cryptography==41.0.7
+pycryptodome==3.19.0
+
+# Database (Optional)
+sqlalchemy==2.0.23
+alembic==1.12.1
+
+# Async Support
+httpx==0.25.1
+websockets==12.0
+
+# Monitoring
+prometheus-client==0.19.0
+
+# Compression
+zstandard==0.22.0
